@@ -107,6 +107,20 @@ public:
 		meta=(ExposeOnSpawn, EditCondition="bGeneratePath", EditConditionHides))
 	FMazeCoordinates PathEnd;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Maze|Doors", meta=(ExposeOnSpawn))
+	bool bCreateDoors = false;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Maze|Doors", meta=(ExposeOnSpawn))
+	bool bForceEdgeDoors = true;
+
+	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category="Maze|Doors",
+		meta=(ExposeOnSpawn, EditCondition="bCreateDoors", EditConditionHides))
+	FMazeCoordinates EntranceDoor;
+
+	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category="Maze|Doors",
+		meta=(ExposeOnSpawn, EditCondition="bCreateDoors", EditConditionHides))
+	FMazeCoordinates ExitDoor;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, DisplayName="Path Floor", Category="Maze|Pathfinder",
 		meta=(ExposeOnSpawn, EditCondition="bGeneratePath", EditConditionHides))
 	UStaticMesh* PathStaticMesh;
@@ -145,12 +159,49 @@ public:
 	UFUNCTION(BlueprintCallable, Category="Maze")
 	virtual void UpdateMaze();
 
-	/** 
+	/**
+	 * Returns an array of random floor locations in world space.
+	 * @param Count - Number of random locations to return. If Count exceeds available floor cells, returns all available.
+	 * @return Array of world space positions on floor cells
+	 */
+	UFUNCTION(BlueprintCallable, Category="Maze")
+	virtual TArray<FVector> GetRandomFloorLocations(int32 Count);
+
+	/**
+	 * Returns all floor locations in the maze in world space.
+	 * @return Array of world space positions of all floor cells
+	 */
+	UFUNCTION(BlueprintCallable, Category="Maze")
+	virtual TArray<FVector> GetAllFloorLocations();
+
+	/**
+	 * Returns the path start position and rotation in world space.
+	 * Rotation is calculated to face into the maze from the entrance.
+	 * @return Transform with position and rotation facing into the maze
+	 */
+	UFUNCTION(BlueprintCallable, Category="Maze")
+	virtual FTransform GetPathStartTransform();
+
+	/**
+	 * Returns the path end position and rotation in world space.
+	 * Rotation is calculated to face into the maze from the exit.
+	 * @return Transform with position and rotation facing into the maze
+	 */
+	UFUNCTION(BlueprintCallable, Category="Maze")
+	virtual FTransform GetPathEndTransform();
+
+	/**
 	 * Updates Maze every time any parameter has been changed(except transform).
-	 * 
-	 * Remember: this method is being called before BeginPlay. 
+	 *
+	 * Remember: this method is being called before BeginPlay.
 	 */
 	virtual void OnConstruction(const FTransform& Transform) override;
+
+	/**
+	 * Called when the game starts or when spawned.
+	 * Regenerates the maze at runtime.
+	 */
+	virtual void BeginPlay() override;
 
 	/**
 	 * Returns path grid mapped into MazeGrid constrains. Creates a graph every time it is called.
