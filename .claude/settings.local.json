@@ -3,7 +3,16 @@
     "allow": [
       "Bash(git init:*)",
       "Bash(git remote add:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git branch:*)",
+      "Bash(git push:*)",
+      "Read(//c/Dev/**)",
+      "Read(//c/Program Files/Epic Games/UE_5.5/**)",
+      "Bash(dir:*)",
+      "Bash(rd:*)",
+      "Bash(if exist:*)",
+      "Bash(cmd /c:*)"
     ],
     "deny": [],
     "ask": []
