@@ -96,6 +96,17 @@ public:
 		meta=(ExposeOnSpawn, DisplayPriority=2))
 	UStaticMesh* OutlineStaticMesh;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Maze|Endpoint", meta=(ExposeOnSpawn))
+	bool bHasEndpoint = false;
+
+	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category="Maze|Endpoint",
+		meta=(ExposeOnSpawn, EditCondition="bHasEndpoint", EditConditionHides))
+	FMazeCoordinates MazeEndpoint;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, DisplayName="Endpoint Actor Class", Category="Maze|Endpoint",
+		meta=(ExposeOnSpawn, EditCondition="bHasEndpoint", EditConditionHides))
+	TSubclassOf<AActor> EndpointActorClass;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Maze|Pathfinder", meta=(ExposeOnSpawn))
 	bool bGeneratePath = false;
 
@@ -132,6 +143,10 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Maze")
 	bool bUseCollision = true;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Maze|Cells",
+		meta=(ClampMin=1, UIMin=1, UIMax=9, ClampMax=99, NoResetToDefault))
+	int32 FloorWidth = 1;
+
 protected:
 	TArray<TArray<uint8>> MazeGrid;
 
@@ -150,6 +165,9 @@ protected:
 
 	UPROPERTY()
 	UHierarchicalInstancedStaticMeshComponent* PathFloorCells;
+
+	UPROPERTY()
+	AActor* SpawnedEndpointActor;
 
 	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category="Maze|Cells")
 	FVector2D MazeCellSize;	
@@ -173,6 +191,40 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category="Maze")
 	virtual TArray<FVector> GetAllFloorLocations();
+
+	/**
+	 * Returns the maze endpoint position and rotation in world space.
+	 * This is the target location where the player should reach to win.
+	 * @return Transform with position at the endpoint
+	 */
+	UFUNCTION(BlueprintCallable, Category="Maze")
+	virtual FTransform GetMazeEndpointTransform();
+
+	/**
+	 * Spawns the endpoint actor at the maze endpoint location.
+	 * Returns the spawned actor, or nullptr if failed.
+	 * @return Pointer to the spawned endpoint actor
+	 */
+	UFUNCTION(BlueprintCallable, Category="Maze")
+	virtual AActor* SpawnEndpointActor();
+
+	/**
+	 * Returns a random floor position as a spawn point for the player.
+	 * @return Transform with a random floor position
+	 */
+	UFUNCTION(BlueprintCallable, Category="Maze")
+	virtual FTransform GetRandomSpawnTransform();
+
+	/**
+	 * Returns random floor locations excluding already used positions.
+	 * Useful for spawning enemies without overlap with player/endpoint.
+	 * @param Count - Number of random locations to return
+	 * @param ExcludePositions - Array of world positions to exclude (player, endpoint, etc.)
+	 * @param ExclusionRadius - Radius around excluded positions to avoid
+	 * @return Array of world space positions that don't overlap with excluded positions
+	 */
+	UFUNCTION(BlueprintCallable, Category="Maze")
+	virtual TArray<FVector> GetRandomFloorLocationsExcluding(int32 Count, const TArray<FVector>& ExcludePositions, float ExclusionRadius = 100.0f);
 
 	/**
 	 * Returns the path start position and rotation in world space.
@@ -228,7 +280,7 @@ protected:
 	virtual void EnableCollision(const bool bShouldEnable);
 
 	// Clears all HISM instances.
-	virtual void ClearMaze() const;
+	virtual void ClearMaze();
 
 	virtual FVector2D GetMaxCellSize() const;
 

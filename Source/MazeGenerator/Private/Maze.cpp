@@ -14,6 +14,8 @@
 
 #include "Components/HierarchicalInstancedStaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
+#include "Engine/World.h"
+#include "GameFramework/Actor.h"
 
 DEFINE_LOG_CATEGORY(LogMaze);
 
@@ -94,6 +96,8 @@ AMaze::AMaze()
 	{
 		OutlineWallCells->SetupAttachment(GetRootComponent());
 	}
+
+	SpawnedEndpointActor = nullptr;
 }
 
 void AMaze::UpdateMaze()
@@ -125,6 +129,78 @@ void AMaze::UpdateMaze()
 	}
 	MazeGrid = GenerationAlgorithms[GenerationAlgorithm]->GetGrid(MazeSize, Seed);
 
+	// Handle maze endpoint (independent of path generation)
+	if (bHasEndpoint)
+	{
+		// Auto-select random edge floor position for endpoint
+		TArray<FMazeCoordinates> EdgeFloorPositions;
+
+		// Collect all floor cells on the edges
+		for (int32 X = 0; X < MazeSize.X; ++X)
+		{
+			// North edge (Y=0)
+			if (MazeGrid[0][X] == 1)
+			{
+				FMazeCoordinates Coord;
+				Coord.X = X;
+				Coord.Y = 0;
+				EdgeFloorPositions.Add(Coord);
+			}
+			// South edge (Y=MazeSize.Y-1)
+			if (MazeGrid[MazeSize.Y - 1][X] == 1)
+			{
+				FMazeCoordinates Coord;
+				Coord.X = X;
+				Coord.Y = MazeSize.Y - 1;
+				EdgeFloorPositions.Add(Coord);
+			}
+		}
+
+		for (int32 Y = 1; Y < MazeSize.Y - 1; ++Y) // Skip corners already added
+		{
+			// West edge (X=0)
+			if (MazeGrid[Y][0] == 1)
+			{
+				FMazeCoordinates Coord;
+				Coord.X = 0;
+				Coord.Y = Y;
+				EdgeFloorPositions.Add(Coord);
+			}
+			// East edge (X=MazeSize.X-1)
+			if (MazeGrid[Y][MazeSize.X - 1] == 1)
+			{
+				FMazeCoordinates Coord;
+				Coord.X = MazeSize.X - 1;
+				Coord.Y = Y;
+				EdgeFloorPositions.Add(Coord);
+			}
+		}
+
+		// Pick a random edge floor position
+		if (EdgeFloorPositions.Num() > 0)
+		{
+			const int32 RandomIndex = FMath::RandRange(0, EdgeFloorPositions.Num() - 1);
+			MazeEndpoint = EdgeFloorPositions[RandomIndex];
+			UE_LOG(LogMaze, Log, TEXT("Auto-selected endpoint at edge: (%d,%d)"), MazeEndpoint.X, MazeEndpoint.Y);
+		}
+		else
+		{
+			// Fallback: use a corner
+			UE_LOG(LogMaze, Warning, TEXT("No edge floor positions found. Using corner as endpoint."));
+			MazeEndpoint.X = MazeSize.X - 1;
+			MazeEndpoint.Y = MazeSize.Y - 1;
+		}
+
+		// Optionally auto-set exit door at endpoint
+		if (bCreateDoors && !bGeneratePath)
+		{
+			ExitDoor = MazeEndpoint;
+		}
+
+		// Spawn endpoint mesh if provided (done after maze generation loop)
+		// This will be done at the end of UpdateMaze after all cells are placed
+	}
+
 	if (bGeneratePath)
 	{
 		PathStart.ClampByMazeSize(MazeSize);
@@ -150,27 +226,102 @@ void AMaze::UpdateMaze()
 	{
 		// Clamp door positions if path generation is disabled
 		EntranceDoor.ClampByMazeSize(MazeSize);
-		ExitDoor.ClampByMazeSize(MazeSize);
+		if (!bHasEndpoint)
+		{
+			ExitDoor.ClampByMazeSize(MazeSize);
+		}
 	}
+
+	// Calculate the scaled cell size based on floor width
+	const FVector2D ScaledCellSize = MazeCellSize * FloorWidth;
+	const FVector FloorScale(FloorWidth, FloorWidth, 1.0f);
 
 	for (int32 Y = 0; Y < MazeSize.Y; ++Y)
 	{
 		for (int32 X = 0; X < MazeSize.X; ++X)
 		{
+			// Calculate center position for this logical cell
+			const FVector CenterLocation(
+				ScaledCellSize.X * X + (ScaledCellSize.X * 0.5f) - (MazeCellSize.X * 0.5f),
+				ScaledCellSize.Y * Y + (ScaledCellSize.Y * 0.5f) - (MazeCellSize.Y * 0.5f),
+				0.f);
+
 			if (bGeneratePath && PathStaticMesh && MazePathGrid.Num() > 0 && MazePathGrid[Y][X])
 			{
-				const FVector Location(MazeCellSize.X * X, MazeCellSize.Y * Y, 0.f);
-				PathFloorCells->AddInstance(FTransform(Location));
+				// Scale the path floor cell by FloorWidth from center
+				FTransform Transform(CenterLocation);
+				Transform.SetScale3D(FloorScale);
+				PathFloorCells->AddInstance(Transform);
 			}
 			else if (MazeGrid[Y][X])
 			{
-				const FVector Location{MazeCellSize.X * X, MazeCellSize.Y * Y, 0.f};
-				FloorCells->AddInstance(FTransform(Location));
+				// Scale the floor cell by FloorWidth from center
+				FTransform Transform(CenterLocation);
+				Transform.SetScale3D(FloorScale);
+				FloorCells->AddInstance(Transform);
 			}
 			else
 			{
-				const FVector Location{MazeCellSize.X * X, MazeCellSize.Y * Y, 0.f};
-				WallCells->AddInstance(FTransform(Location));
+				// For walls: check ALL 4 neighbors to determine proper scaling
+				// Count adjacent walls in each direction to determine wall continuity
+
+				bool bHasWallLeft = (X > 0 && !MazeGrid[Y][X - 1]);
+				bool bHasWallRight = (X < MazeSize.X - 1 && !MazeGrid[Y][X + 1]);
+				bool bHasWallTop = (Y > 0 && !MazeGrid[Y - 1][X]);
+				bool bHasWallBottom = (Y < MazeSize.Y - 1 && !MazeGrid[Y + 1][X]);
+
+				// Check if on edge
+				bool bIsLeftEdge = (X == 0);
+				bool bIsRightEdge = (X == MazeSize.X - 1);
+				bool bIsTopEdge = (Y == 0);
+				bool bIsBottomEdge = (Y == MazeSize.Y - 1);
+
+				// Count wall neighbors in horizontal (X) and vertical (Y) directions
+				int32 HorizontalWallNeighbors = (bHasWallLeft ? 1 : 0) + (bHasWallRight ? 1 : 0);
+				int32 VerticalWallNeighbors = (bHasWallTop ? 1 : 0) + (bHasWallBottom ? 1 : 0);
+
+				// Add edge contributions
+				if (bIsLeftEdge) HorizontalWallNeighbors++;
+				if (bIsRightEdge) HorizontalWallNeighbors++;
+				if (bIsTopEdge) VerticalWallNeighbors++;
+				if (bIsBottomEdge) VerticalWallNeighbors++;
+
+				FVector WallScale;
+
+				// Determine scaling based on wall continuity
+				if (HorizontalWallNeighbors >= 1 && VerticalWallNeighbors == 0)
+				{
+					// Horizontal wall segment: scale along X
+					WallScale = FVector(FloorWidth, 1.0f, 1.0f);
+				}
+				else if (VerticalWallNeighbors >= 1 && HorizontalWallNeighbors == 0)
+				{
+					// Vertical wall segment: scale along Y
+					WallScale = FVector(1.0f, FloorWidth, 1.0f);
+				}
+				else
+				{
+					// Corner, intersection, or isolated: scale both or determine dominant direction
+					if (HorizontalWallNeighbors > VerticalWallNeighbors)
+					{
+						// More horizontal continuity
+						WallScale = FVector(FloorWidth, 1.0f, 1.0f);
+					}
+					else if (VerticalWallNeighbors > HorizontalWallNeighbors)
+					{
+						// More vertical continuity
+						WallScale = FVector(1.0f, FloorWidth, 1.0f);
+					}
+					else
+					{
+						// Equal or both directions: scale both (corner/intersection)
+						WallScale = FVector(FloorWidth, FloorWidth, 1.0f);
+					}
+				}
+
+				FTransform Transform(CenterLocation);
+				Transform.SetScale3D(WallScale);
+				WallCells->AddInstance(Transform);
 			}
 		}
 	}
@@ -180,25 +331,32 @@ void AMaze::UpdateMaze()
 
 void AMaze::CreateMazeOutline() const
 {
+	// Calculate the scaled cell size based on floor width
+	const FVector2D ScaledCellSize = MazeCellSize * FloorWidth;
+
 	FVector Location1{0.f};
 	FVector Location2{0.f};
 
 	// Create north and south walls (top and bottom)
 	Location1.Y = -MazeCellSize.Y;
-	Location2.Y = MazeCellSize.Y * MazeSize.Y;
-	for (int32 X = -1; X < MazeSize.X + 1; ++X)
-	{
-		Location1.X = Location2.X = X * MazeCellSize.X;
+	Location2.Y = ScaledCellSize.Y * MazeSize.Y;
 
-		// Skip north wall if this is the entrance or exit door position
-		bool bSkipNorthWall = bCreateDoors && ((EntranceDoor.X == X && EntranceDoor.Y == 0) || (ExitDoor.X == X && ExitDoor.Y == 0));
+	// Place outline walls for each floor width unit
+	for (int32 FX = -1; FX < MazeSize.X * FloorWidth + 1; ++FX)
+	{
+		Location1.X = Location2.X = FX * MazeCellSize.X;
+
+		// Check if this position corresponds to a door
+		int32 GridX = FX / FloorWidth;
+		bool bSkipNorthWall = bCreateDoors && GridX >= 0 && GridX < MazeSize.X &&
+			((EntranceDoor.X == GridX && EntranceDoor.Y == 0) || (ExitDoor.X == GridX && ExitDoor.Y == 0));
 		if (!bSkipNorthWall)
 		{
 			OutlineWallCells->AddInstance(FTransform{Location1});
 		}
 
-		// Skip south wall if this is the entrance or exit door position
-		bool bSkipSouthWall = bCreateDoors && ((EntranceDoor.X == X && EntranceDoor.Y == MazeSize.Y - 1) || (ExitDoor.X == X && ExitDoor.Y == MazeSize.Y - 1));
+		bool bSkipSouthWall = bCreateDoors && GridX >= 0 && GridX < MazeSize.X &&
+			((EntranceDoor.X == GridX && EntranceDoor.Y == MazeSize.Y - 1) || (ExitDoor.X == GridX && ExitDoor.Y == MazeSize.Y - 1));
 		if (!bSkipSouthWall)
 		{
 			OutlineWallCells->AddInstance(FTransform{Location2});
@@ -207,20 +365,23 @@ void AMaze::CreateMazeOutline() const
 
 	// Create west and east walls (left and right)
 	Location1.X = -MazeCellSize.X;
-	Location2.X = MazeCellSize.X * MazeSize.X;
-	for (int32 Y = 0; Y < MazeSize.Y; ++Y)
-	{
-		Location1.Y = Location2.Y = Y * MazeCellSize.Y;
+	Location2.X = ScaledCellSize.X * MazeSize.X;
 
-		// Skip west wall if this is the entrance or exit door position
-		bool bSkipWestWall = bCreateDoors && ((EntranceDoor.X == 0 && EntranceDoor.Y == Y) || (ExitDoor.X == 0 && ExitDoor.Y == Y));
+	for (int32 FY = 0; FY < MazeSize.Y * FloorWidth; ++FY)
+	{
+		Location1.Y = Location2.Y = FY * MazeCellSize.Y;
+
+		// Check if this position corresponds to a door
+		int32 GridY = FY / FloorWidth;
+		bool bSkipWestWall = bCreateDoors && GridY >= 0 && GridY < MazeSize.Y &&
+			((EntranceDoor.X == 0 && EntranceDoor.Y == GridY) || (ExitDoor.X == 0 && ExitDoor.Y == GridY));
 		if (!bSkipWestWall)
 		{
 			OutlineWallCells->AddInstance(FTransform{Location1});
 		}
 
-		// Skip east wall if this is the entrance or exit door position
-		bool bSkipEastWall = bCreateDoors && ((EntranceDoor.X == MazeSize.X - 1 && EntranceDoor.Y == Y) || (ExitDoor.X == MazeSize.X - 1 && ExitDoor.Y == Y));
+		bool bSkipEastWall = bCreateDoors && GridY >= 0 && GridY < MazeSize.Y &&
+			((EntranceDoor.X == MazeSize.X - 1 && EntranceDoor.Y == GridY) || (ExitDoor.X == MazeSize.X - 1 && ExitDoor.Y == GridY));
 		if (!bSkipEastWall)
 		{
 			OutlineWallCells->AddInstance(FTransform{Location2});
@@ -356,12 +517,31 @@ void AMaze::EnableCollision(const bool bShouldEnable)
 }
 
 
-void AMaze::ClearMaze() const
+void AMaze::ClearMaze()
 {
-	FloorCells->ClearInstances();
-	WallCells->ClearInstances();
-	OutlineWallCells->ClearInstances();
-	PathFloorCells->ClearInstances();
+	if (FloorCells)
+	{
+		FloorCells->ClearInstances();
+	}
+	if (WallCells)
+	{
+		WallCells->ClearInstances();
+	}
+	if (OutlineWallCells)
+	{
+		OutlineWallCells->ClearInstances();
+	}
+	if (PathFloorCells)
+	{
+		PathFloorCells->ClearInstances();
+	}
+
+	// Destroy previously spawned endpoint actor
+	if (SpawnedEndpointActor && IsValid(SpawnedEndpointActor))
+	{
+		SpawnedEndpointActor->Destroy();
+		SpawnedEndpointActor = nullptr;
+	}
 }
 
 FVector2D AMaze::GetMaxCellSize() const
@@ -522,8 +702,11 @@ TArray<FVector> AMaze::GetAllFloorLocations()
 
 	UE_LOG(LogMaze, Log, TEXT("GetAllFloorLocations: MazeGrid size is %dx%d"), MazeSize.X, MazeSize.Y);
 
-	// Reserve approximate space (assuming roughly half the cells are floors)
-	FloorLocations.Reserve(MazeSize.X * MazeSize.Y / 2);
+	// Reserve space accounting for FloorWidth (each logical cell has FloorWidth^2 physical tiles)
+	FloorLocations.Reserve(MazeSize.X * MazeSize.Y * FloorWidth * FloorWidth / 2);
+
+	// Calculate the scaled cell size based on floor width
+	const FVector2D ScaledCellSize = MazeCellSize * FloorWidth;
 
 	const FTransform& ActorTransform = GetActorTransform();
 
@@ -534,13 +717,23 @@ TArray<FVector> AMaze::GetAllFloorLocations()
 			// Check if this is a floor cell (value = 1)
 			if (MazeGrid[Y][X])
 			{
-				// Convert grid coordinates to local position
-				const FVector LocalPosition(MazeCellSize.X * X, MazeCellSize.Y * Y, 0.f);
+				// For each logical floor cell, return all physical floor tile positions
+				for (int32 FY = 0; FY < FloorWidth; ++FY)
+				{
+					for (int32 FX = 0; FX < FloorWidth; ++FX)
+					{
+						// Calculate position of each physical floor tile
+						const FVector LocalPosition(
+							ScaledCellSize.X * X + MazeCellSize.X * FX + (MazeCellSize.X * 0.5f),
+							ScaledCellSize.Y * Y + MazeCellSize.Y * FY + (MazeCellSize.Y * 0.5f),
+							0.f);
 
-				// Transform to world space
-				const FVector WorldPosition = ActorTransform.TransformPosition(LocalPosition);
+						// Transform to world space
+						const FVector WorldPosition = ActorTransform.TransformPosition(LocalPosition);
 
-				FloorLocations.Add(WorldPosition);
+						FloorLocations.Add(WorldPosition);
+					}
+				}
 			}
 		}
 	}
@@ -552,8 +745,18 @@ TArray<FVector> AMaze::GetAllFloorLocations()
 
 FTransform AMaze::GetPathStartTransform()
 {
-	// Convert grid coordinates to local position
-	const FVector LocalPosition(MazeCellSize.X * PathStart.X, MazeCellSize.Y * PathStart.Y, 0.f);
+	// Calculate the scaled cell size based on floor width
+	const FVector2D ScaledCellSize = MazeCellSize * FloorWidth;
+
+	// Calculate base position of the logical cell
+	FVector LocalPosition(
+		ScaledCellSize.X * PathStart.X,
+		ScaledCellSize.Y * PathStart.Y,
+		0.f);
+
+	// Add offset to center of the first physical floor tile within the cell
+	LocalPosition.X += MazeCellSize.X * 0.5f;
+	LocalPosition.Y += MazeCellSize.Y * 0.5f;
 
 	// Calculate rotation based on which edge the entrance is on
 	FRotator Rotation = FRotator::ZeroRotator;
@@ -588,8 +791,18 @@ FTransform AMaze::GetPathStartTransform()
 
 FTransform AMaze::GetPathEndTransform()
 {
-	// Convert grid coordinates to local position
-	const FVector LocalPosition(MazeCellSize.X * PathEnd.X, MazeCellSize.Y * PathEnd.Y, 0.f);
+	// Calculate the scaled cell size based on floor width
+	const FVector2D ScaledCellSize = MazeCellSize * FloorWidth;
+
+	// Calculate base position of the logical cell
+	FVector LocalPosition(
+		ScaledCellSize.X * PathEnd.X,
+		ScaledCellSize.Y * PathEnd.Y,
+		0.f);
+
+	// Add offset to center of the first physical floor tile within the cell
+	LocalPosition.X += MazeCellSize.X * 0.5f;
+	LocalPosition.Y += MazeCellSize.Y * 0.5f;
 
 	// Calculate rotation based on which edge the exit is on
 	FRotator Rotation = FRotator::ZeroRotator;
@@ -620,6 +833,188 @@ FTransform AMaze::GetPathEndTransform()
 
 	// Transform to world space
 	return LocalTransform * GetActorTransform();
+}
+
+FTransform AMaze::GetMazeEndpointTransform()
+{
+	if (!bHasEndpoint)
+	{
+		UE_LOG(LogMaze, Warning, TEXT("GetMazeEndpointTransform called but bHasEndpoint is false!"));
+		return GetActorTransform();
+	}
+
+	// Calculate the scaled cell size based on floor width
+	const FVector2D ScaledCellSize = MazeCellSize * FloorWidth;
+
+	// Calculate base position of the logical cell
+	FVector LocalPosition(
+		ScaledCellSize.X * MazeEndpoint.X,
+		ScaledCellSize.Y * MazeEndpoint.Y,
+		0.f);
+
+	// Add offset to center of the scaled cell (center of the endpoint area)
+	LocalPosition.X += ScaledCellSize.X * 0.5f;
+	LocalPosition.Y += ScaledCellSize.Y * 0.5f;
+
+	// Calculate rotation based on which edge the endpoint is on
+	FRotator Rotation = FRotator::ZeroRotator;
+
+	if (MazeEndpoint.Y == 0)
+	{
+		// North edge (Y=0) - face south (into maze)
+		Rotation.Yaw = 90.0f;
+	}
+	else if (MazeEndpoint.Y == MazeSize.Y - 1)
+	{
+		// South edge - face north (into maze)
+		Rotation.Yaw = -90.0f;
+	}
+	else if (MazeEndpoint.X == 0)
+	{
+		// West edge (X=0) - face east (into maze)
+		Rotation.Yaw = 0.0f;
+	}
+	else if (MazeEndpoint.X == MazeSize.X - 1)
+	{
+		// East edge - face west (into maze)
+		Rotation.Yaw = 180.0f;
+	}
+
+	// Create local transform
+	FTransform LocalTransform(Rotation, LocalPosition);
+
+	// Transform to world space
+	return LocalTransform * GetActorTransform();
+}
+
+AActor* AMaze::SpawnEndpointActor()
+{
+	if (!bHasEndpoint)
+	{
+		UE_LOG(LogMaze, Warning, TEXT("SpawnEndpointActor called but bHasEndpoint is false!"));
+		return nullptr;
+	}
+
+	if (!EndpointActorClass)
+	{
+		UE_LOG(LogMaze, Warning, TEXT("SpawnEndpointActor called but EndpointActorClass is not set!"));
+		return nullptr;
+	}
+
+	// Validate world exists
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogMaze, Error, TEXT("SpawnEndpointActor: World is null!"));
+		return nullptr;
+	}
+
+	// Destroy existing endpoint actor if any
+	if (SpawnedEndpointActor && IsValid(SpawnedEndpointActor))
+	{
+		SpawnedEndpointActor->Destroy();
+		SpawnedEndpointActor = nullptr;
+	}
+
+	// Get the endpoint transform
+	FTransform EndpointTransform = GetMazeEndpointTransform();
+
+	// Spawn the actor
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.Owner = this;
+	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+	SpawnedEndpointActor = World->SpawnActor<AActor>(EndpointActorClass, EndpointTransform, SpawnParams);
+
+	if (SpawnedEndpointActor)
+	{
+		UE_LOG(LogMaze, Log, TEXT("Spawned endpoint actor '%s' at (%s)"),
+			*SpawnedEndpointActor->GetName(),
+			*EndpointTransform.GetLocation().ToString());
+	}
+	else
+	{
+		UE_LOG(LogMaze, Error, TEXT("Failed to spawn endpoint actor of class '%s'!"),
+			*EndpointActorClass->GetName());
+	}
+
+	return SpawnedEndpointActor;
+}
+
+FTransform AMaze::GetRandomSpawnTransform()
+{
+	TArray<FVector> FloorLocations = GetRandomFloorLocations(1);
+
+	if (FloorLocations.Num() == 0)
+	{
+		UE_LOG(LogMaze, Warning, TEXT("GetRandomSpawnTransform: No floor locations available!"));
+		return GetActorTransform();
+	}
+
+	// Return transform at random floor location with default rotation
+	return FTransform(FRotator::ZeroRotator, FloorLocations[0]);
+}
+
+TArray<FVector> AMaze::GetRandomFloorLocationsExcluding(int32 Count, const TArray<FVector>& ExcludePositions, float ExclusionRadius)
+{
+	TArray<FVector> AllFloorLocations = GetAllFloorLocations();
+	TArray<FVector> ValidLocations;
+
+	// Filter out locations that are too close to excluded positions
+	for (const FVector& FloorLocation : AllFloorLocations)
+	{
+		bool bTooClose = false;
+
+		for (const FVector& ExcludedPos : ExcludePositions)
+		{
+			const float DistanceSquared = FVector::DistSquared(FloorLocation, ExcludedPos);
+			const float RadiusSquared = ExclusionRadius * ExclusionRadius;
+
+			if (DistanceSquared < RadiusSquared)
+			{
+				bTooClose = true;
+				break;
+			}
+		}
+
+		if (!bTooClose)
+		{
+			ValidLocations.Add(FloorLocation);
+		}
+	}
+
+	if (ValidLocations.Num() == 0)
+	{
+		UE_LOG(LogMaze, Warning, TEXT("GetRandomFloorLocationsExcluding: No valid locations found after exclusion!"));
+		return TArray<FVector>();
+	}
+
+	// Return all valid locations if requested count exceeds available
+	if (Count >= ValidLocations.Num())
+	{
+		UE_LOG(LogMaze, Log, TEXT("GetRandomFloorLocationsExcluding: Requested %d, returning all %d valid locations"), Count, ValidLocations.Num());
+		return ValidLocations;
+	}
+
+	// Shuffle and return random subset
+	TArray<FVector> RandomLocations;
+	RandomLocations.Reserve(Count);
+
+	// Shuffle the valid locations
+	for (int32 i = ValidLocations.Num() - 1; i > 0; --i)
+	{
+		const int32 j = FMath::RandRange(0, i);
+		ValidLocations.Swap(i, j);
+	}
+
+	// Take first Count elements
+	for (int32 i = 0; i < Count; ++i)
+	{
+		RandomLocations.Add(ValidLocations[i]);
+	}
+
+	UE_LOG(LogMaze, Log, TEXT("GetRandomFloorLocationsExcluding: Returning %d random locations"), RandomLocations.Num());
+	return RandomLocations;
 }
 
 void AMaze::BeginPlay()
