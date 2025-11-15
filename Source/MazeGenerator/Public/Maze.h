@@ -88,9 +88,13 @@ public:
 		meta=(NoResetToDefault, ExposeOnSpawn, DisplayPriority=0))
 	UStaticMesh* FloorStaticMesh;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, DisplayName="Wall", Category="Maze|Cells",
+	// Deprecated: Use WallStaticMeshes array instead
+	UPROPERTY()
+	UStaticMesh* WallStaticMesh_DEPRECATED;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, DisplayName="Wall Meshes", Category="Maze|Cells",
 		meta=(NoResetToDefault, ExposeOnSpawn, DisplayPriority=1))
-	UStaticMesh* WallStaticMesh;
+	TArray<UStaticMesh*> WallStaticMeshes;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, DisplayName="Outline Wall", Category="Maze|Cells",
 		meta=(ExposeOnSpawn, DisplayPriority=2))
@@ -143,9 +147,34 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Maze")
 	bool bUseCollision = true;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Maze|Debug",
+		meta=(DisplayName="Show Floor Outlines"))
+	bool bShowFloorDebug = false;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Maze|Cells",
+		meta=(ClampMin=1, UIMin=1, UIMax=20, ClampMax=100, DisplayName="Spawn Grid Subdivisions",
+		ToolTip="How many spawn points per floor cell. Higher = more spawn locations."))
+	int32 SpawnGridSubdivisions = 1;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Maze|Cells",
 		meta=(ClampMin=1, UIMin=1, UIMax=9, ClampMax=99, NoResetToDefault))
 	int32 FloorWidth = 1;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Maze|Cells",
+		meta=(ClampMin=0.1, UIMin=0.1, UIMax=10.0, ClampMax=100.0))
+	float WallThickness = 1.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Maze|Cells",
+		meta=(ClampMin=0.1, UIMin=0.1, UIMax=10.0, ClampMax=100.0))
+	float WallHeight = 1.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Maze|Cells",
+		meta=(ClampMin=0.1, UIMin=0.1, UIMax=10.0, ClampMax=100.0))
+	float OutlineWallThickness = 1.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Maze|Cells",
+		meta=(ClampMin=0.1, UIMin=0.1, UIMax=10.0, ClampMax=100.0))
+	float OutlineWallHeight = 1.0f;
 
 protected:
 	TArray<TArray<uint8>> MazeGrid;
@@ -157,14 +186,21 @@ protected:
 	UPROPERTY()
 	UHierarchicalInstancedStaticMeshComponent* FloorCells;
 
+	// Deprecated: Kept for backward compatibility only
 	UPROPERTY()
-	UHierarchicalInstancedStaticMeshComponent* WallCells;
+	UHierarchicalInstancedStaticMeshComponent* WallCells_DEPRECATED;
+
+	UPROPERTY()
+	TArray<UHierarchicalInstancedStaticMeshComponent*> WallCellsArray;
 
 	UPROPERTY()
 	UHierarchicalInstancedStaticMeshComponent* OutlineWallCells;
 
 	UPROPERTY()
 	UHierarchicalInstancedStaticMeshComponent* PathFloorCells;
+
+	UPROPERTY()
+	UHierarchicalInstancedStaticMeshComponent* DebugFloorOutlines;
 
 	UPROPERTY()
 	AActor* SpawnedEndpointActor;
@@ -254,6 +290,11 @@ public:
 	 * Regenerates the maze at runtime.
 	 */
 	virtual void BeginPlay() override;
+
+	/**
+	 * Called after object is loaded from disk. Used to migrate old data format to new format.
+	 */
+	virtual void PostLoad() override;
 
 	/**
 	 * Returns path grid mapped into MazeGrid constrains. Creates a graph every time it is called.

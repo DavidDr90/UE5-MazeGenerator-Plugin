@@ -85,10 +85,11 @@ AMaze::AMaze()
 		PathFloorCells->SetupAttachment(GetRootComponent());
 	}
 
-	WallCells = CreateDefaultSubobject<UHierarchicalInstancedStaticMeshComponent>(TEXT("WallCells"));
-	if (WallCells)
+	// Keep deprecated component for backward compatibility (prevents crashes when loading old actors)
+	WallCells_DEPRECATED = CreateDefaultSubobject<UHierarchicalInstancedStaticMeshComponent>(TEXT("WallCells"));
+	if (WallCells_DEPRECATED)
 	{
-		WallCells->SetupAttachment(GetRootComponent());
+		WallCells_DEPRECATED->SetupAttachment(GetRootComponent());
 	}
 
 	OutlineWallCells = CreateDefaultSubobject<UHierarchicalInstancedStaticMeshComponent>(TEXT("OutlineWallCells"));
@@ -97,21 +98,169 @@ AMaze::AMaze()
 		OutlineWallCells->SetupAttachment(GetRootComponent());
 	}
 
+	DebugFloorOutlines = CreateDefaultSubobject<UHierarchicalInstancedStaticMeshComponent>(TEXT("DebugFloorOutlines"));
+	if (DebugFloorOutlines)
+	{
+		DebugFloorOutlines->SetupAttachment(GetRootComponent());
+		DebugFloorOutlines->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	}
+
 	SpawnedEndpointActor = nullptr;
 }
 
 void AMaze::UpdateMaze()
 {
+	UE_LOG(LogMaze, Log, TEXT("=== UpdateMaze START === Actor: %s"), *GetName());
+	UE_LOG(LogMaze, Log, TEXT("  MazeSize: %dx%d, FloorWidth: %d, SpawnGridSubdivisions: %d"),
+		MazeSize.X, MazeSize.Y, FloorWidth, SpawnGridSubdivisions);
+	UE_LOG(LogMaze, Log, TEXT("  Algorithm: %d, Seed: %d, bHasEndpoint: %d, bGeneratePath: %d"),
+		(int32)GenerationAlgorithm, Seed, bHasEndpoint, bGeneratePath);
+	UE_LOG(LogMaze, Log, TEXT("  WallCellsArray has %d components before ClearMaze"), WallCellsArray.Num());
+
 	ClearMaze();
 
-	if (!(FloorStaticMesh && WallStaticMesh))
+	// Remove any null entries from wall meshes array
+	int32 NullCount = 0;
+	WallStaticMeshes.RemoveAll([&NullCount](UStaticMesh* Mesh) {
+		if (Mesh == nullptr) {
+			NullCount++;
+			return true;
+		}
+		return false;
+	});
+	if (NullCount > 0)
 	{
-		UE_LOG(LogMaze, Warning, TEXT("To create maze specify FloorStaticMesh and WallStaticMesh."));
+		UE_LOG(LogMaze, Warning, TEXT("  Removed %d null wall meshes from array"), NullCount);
+	}
+
+	if (!(FloorStaticMesh && WallStaticMeshes.Num() > 0))
+	{
+		UE_LOG(LogMaze, Error, TEXT("  FAILED: FloorStaticMesh=%s, WallStaticMeshes.Num=%d"),
+			FloorStaticMesh ? *FloorStaticMesh->GetName() : TEXT("NULL"),
+			WallStaticMeshes.Num());
 		return;
 	}
 
+	UE_LOG(LogMaze, Log, TEXT("  Creating maze with %d wall mesh(es), Floor: %s"),
+		WallStaticMeshes.Num(), *FloorStaticMesh->GetName());
+
 	FloorCells->SetStaticMesh(FloorStaticMesh);
-	WallCells->SetStaticMesh(WallStaticMesh);
+
+	// Setup debug floor outlines with engine's default cube mesh
+	if (bShowFloorDebug && DebugFloorOutlines)
+	{
+		// Use engine's default cube mesh
+		UStaticMesh* CubeMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+		if (CubeMesh)
+		{
+			DebugFloorOutlines->SetStaticMesh(CubeMesh);
+			DebugFloorOutlines->SetVisibility(true);
+		}
+	}
+	else if (DebugFloorOutlines)
+	{
+		DebugFloorOutlines->SetVisibility(false);
+	}
+
+	// Ensure we have enough HISM components for all wall meshes
+	// Check if existing components are still valid, remove null ones
+	for (int32 i = WallCellsArray.Num() - 1; i >= 0; --i)
+	{
+		if (!WallCellsArray[i] || !IsValid(WallCellsArray[i]))
+		{
+			UE_LOG(LogMaze, Warning, TEXT("Removing invalid component at index %d"), i);
+			WallCellsArray.RemoveAt(i);
+		}
+	}
+
+	// Create new components as needed
+	while (WallCellsArray.Num() < WallStaticMeshes.Num())
+	{
+		FString ComponentName = FString::Printf(TEXT("WallCells_%d"), WallCellsArray.Num());
+
+		UHierarchicalInstancedStaticMeshComponent* WallComponent = nullptr;
+
+#if WITH_EDITOR
+		// In editor, use CreateDefaultSubobject-like behavior for construction script
+		if (GetWorld() && !GetWorld()->IsGameWorld())
+		{
+			WallComponent = NewObject<UHierarchicalInstancedStaticMeshComponent>(
+				this, UHierarchicalInstancedStaticMeshComponent::StaticClass(), FName(*ComponentName),
+				RF_Transactional | RF_Public);
+
+			if (WallComponent)
+			{
+				WallComponent->CreationMethod = EComponentCreationMethod::Instance;
+				WallComponent->SetupAttachment(GetRootComponent());
+				WallComponent->OnComponentCreated();
+				WallComponent->RegisterComponent();
+
+				// Ensure component is visible and properly attached
+				WallComponent->SetVisibility(true);
+				WallComponent->SetHiddenInGame(false);
+
+				UE_LOG(LogMaze, Log, TEXT("Created wall component %d in editor mode"), WallCellsArray.Num());
+			}
+		}
+		else
+#endif
+		{
+			// At runtime
+			WallComponent = NewObject<UHierarchicalInstancedStaticMeshComponent>(
+				this, UHierarchicalInstancedStaticMeshComponent::StaticClass(), FName(*ComponentName), RF_Transactional);
+
+			if (WallComponent)
+			{
+				WallComponent->SetupAttachment(GetRootComponent());
+				WallComponent->RegisterComponent();
+				WallComponent->SetVisibility(true);
+				WallComponent->SetHiddenInGame(false);
+
+				UE_LOG(LogMaze, Log, TEXT("Created wall component %d in runtime mode"), WallCellsArray.Num());
+			}
+		}
+
+		if (WallComponent)
+		{
+			WallComponent->SetCollisionEnabled(bUseCollision ? ECollisionEnabled::QueryAndPhysics : ECollisionEnabled::NoCollision);
+
+			// Add to owned components array so it's tracked by actor
+			AddInstanceComponent(WallComponent);
+
+			WallCellsArray.Add(WallComponent);
+			UE_LOG(LogMaze, Log, TEXT("Successfully added wall component to array. Total: %d"), WallCellsArray.Num());
+		}
+		else
+		{
+			UE_LOG(LogMaze, Error, TEXT("Failed to create wall component %d"), WallCellsArray.Num());
+		}
+	}
+
+	// Log final state
+	UE_LOG(LogMaze, Log, TEXT("After component creation: WallCellsArray has %d components"), WallCellsArray.Num());
+	for (int32 i = 0; i < WallCellsArray.Num(); ++i)
+	{
+		if (WallCellsArray[i])
+		{
+			UE_LOG(LogMaze, Log, TEXT("  Component %d: Valid (%s)"), i, *WallCellsArray[i]->GetName());
+		}
+		else
+		{
+			UE_LOG(LogMaze, Error, TEXT("  Component %d: NULL!"), i);
+		}
+	}
+
+	// Set meshes for each component
+	for (int32 i = 0; i < WallStaticMeshes.Num(); ++i)
+	{
+		if (WallCellsArray.IsValidIndex(i) && WallCellsArray[i])
+		{
+			WallCellsArray[i]->SetStaticMesh(WallStaticMeshes[i]);
+			WallCellsArray[i]->SetVisibility(true);
+			WallCellsArray[i]->SetHiddenInGame(false);
+		}
+	}
+
 	if (OutlineStaticMesh)
 	{
 		OutlineWallCells->SetStaticMesh(OutlineStaticMesh);
@@ -259,6 +408,34 @@ void AMaze::UpdateMaze()
 				FTransform Transform(CenterLocation);
 				Transform.SetScale3D(FloorScale);
 				FloorCells->AddInstance(Transform);
+
+				// Add debug outline if enabled
+				if (bShowFloorDebug && DebugFloorOutlines)
+				{
+					// Show the actual spawn grid - matches GetAllFloorLocations()
+					const int32 TotalSubdivisions = FloorWidth * SpawnGridSubdivisions;
+					const float SpawnSpacingX = MazeCellSize.X / SpawnGridSubdivisions;
+					const float SpawnSpacingY = MazeCellSize.Y / SpawnGridSubdivisions;
+
+					for (int32 FY = 0; FY < TotalSubdivisions; ++FY)
+					{
+						for (int32 FX = 0; FX < TotalSubdivisions; ++FX)
+						{
+							FVector DebugLocation(
+								ScaledCellSize.X * X + SpawnSpacingX * FX + (SpawnSpacingX * 0.5f),
+								ScaledCellSize.Y * Y + SpawnSpacingY * FY + (SpawnSpacingY * 0.5f),
+								100.f); // Elevated to be visible above walls
+
+							// Engine cube is 100x100x100, scale it down to match spawn grid size
+							FTransform DebugTransform(DebugLocation);
+							DebugTransform.SetScale3D(FVector(
+								(SpawnSpacingX * 0.9f) / 100.0f,  // Scale from 100-unit cube to spawn spacing
+								(SpawnSpacingY * 0.9f) / 100.0f,
+								0.02f)); // Very thin (2 units) so it's just an outline
+							DebugFloorOutlines->AddInstance(DebugTransform);
+						}
+					}
+				}
 			}
 			else
 			{
@@ -291,48 +468,80 @@ void AMaze::UpdateMaze()
 				// Determine scaling based on wall continuity
 				if (HorizontalWallNeighbors >= 1 && VerticalWallNeighbors == 0)
 				{
-					// Horizontal wall segment: scale along X
-					WallScale = FVector(FloorWidth, 1.0f, 1.0f);
+					// Horizontal wall segment: scale along X, apply thickness in Y, height in Z
+					WallScale = FVector(FloorWidth, WallThickness, WallHeight);
 				}
 				else if (VerticalWallNeighbors >= 1 && HorizontalWallNeighbors == 0)
 				{
-					// Vertical wall segment: scale along Y
-					WallScale = FVector(1.0f, FloorWidth, 1.0f);
+					// Vertical wall segment: apply thickness in X, scale along Y, height in Z
+					WallScale = FVector(WallThickness, FloorWidth, WallHeight);
 				}
 				else
 				{
-					// Corner, intersection, or isolated: scale both or determine dominant direction
-					if (HorizontalWallNeighbors > VerticalWallNeighbors)
-					{
-						// More horizontal continuity
-						WallScale = FVector(FloorWidth, 1.0f, 1.0f);
-					}
-					else if (VerticalWallNeighbors > HorizontalWallNeighbors)
-					{
-						// More vertical continuity
-						WallScale = FVector(1.0f, FloorWidth, 1.0f);
-					}
-					else
-					{
-						// Equal or both directions: scale both (corner/intersection)
-						WallScale = FVector(FloorWidth, FloorWidth, 1.0f);
-					}
+					// Corner, intersection, or isolated: use thickness for both dimensions like lane walls
+					WallScale = FVector(WallThickness, WallThickness, WallHeight);
 				}
 
 				FTransform Transform(CenterLocation);
 				Transform.SetScale3D(WallScale);
-				WallCells->AddInstance(Transform);
+
+				// Randomly select a wall mesh component from the array
+				if (WallCellsArray.Num() > 0)
+				{
+					int32 RandomIndex = FMath::RandRange(0, WallCellsArray.Num() - 1);
+					if (WallCellsArray.IsValidIndex(RandomIndex) && WallCellsArray[RandomIndex])
+					{
+						WallCellsArray[RandomIndex]->AddInstance(Transform);
+					}
+					else
+					{
+						UE_LOG(LogMaze, Error, TEXT("Wall component at index %d is null! Array size: %d"), RandomIndex, WallCellsArray.Num());
+					}
+				}
+				else
+				{
+					UE_LOG(LogMaze, Error, TEXT("WallCellsArray is empty when trying to add wall instance!"));
+				}
 			}
 		}
 	}
 
 	EnableCollision(bUseCollision);
+
+	// Log maze generation summary
+	int32 TotalFloorInstances = FloorCells->GetInstanceCount();
+	int32 TotalWallInstances = 0;
+	for (UHierarchicalInstancedStaticMeshComponent* WallComp : WallCellsArray)
+	{
+		if (WallComp)
+		{
+			TotalWallInstances += WallComp->GetInstanceCount();
+		}
+	}
+	int32 TotalOutlineInstances = OutlineWallCells ? OutlineWallCells->GetInstanceCount() : 0;
+	int32 TotalDebugInstances = (bShowFloorDebug && DebugFloorOutlines) ? DebugFloorOutlines->GetInstanceCount() : 0;
+
+	UE_LOG(LogMaze, Log, TEXT("=== UpdateMaze COMPLETE ==="));
+	UE_LOG(LogMaze, Log, TEXT("  Floor instances: %d"), TotalFloorInstances);
+	UE_LOG(LogMaze, Log, TEXT("  Wall instances: %d (across %d components)"), TotalWallInstances, WallCellsArray.Num());
+	UE_LOG(LogMaze, Log, TEXT("  Outline instances: %d"), TotalOutlineInstances);
+	if (bShowFloorDebug)
+	{
+		UE_LOG(LogMaze, Log, TEXT("  Debug floor markers: %d"), TotalDebugInstances);
+	}
+	UE_LOG(LogMaze, Log, TEXT("  Total instances: %d"), TotalFloorInstances + TotalWallInstances + TotalOutlineInstances);
 }
 
 void AMaze::CreateMazeOutline() const
 {
+	UE_LOG(LogMaze, Log, TEXT("CreateMazeOutline: Creating outline with thickness %.2f, height %.2f"),
+		OutlineWallThickness, OutlineWallHeight);
+
 	// Calculate the scaled cell size based on floor width
 	const FVector2D ScaledCellSize = MazeCellSize * FloorWidth;
+
+	// Create scale for outline walls
+	const FVector OutlineScale(OutlineWallThickness, OutlineWallThickness, OutlineWallHeight);
 
 	FVector Location1{0.f};
 	FVector Location2{0.f};
@@ -352,14 +561,14 @@ void AMaze::CreateMazeOutline() const
 			((EntranceDoor.X == GridX && EntranceDoor.Y == 0) || (ExitDoor.X == GridX && ExitDoor.Y == 0));
 		if (!bSkipNorthWall)
 		{
-			OutlineWallCells->AddInstance(FTransform{Location1});
+			OutlineWallCells->AddInstance(FTransform{FRotator::ZeroRotator, Location1, OutlineScale});
 		}
 
 		bool bSkipSouthWall = bCreateDoors && GridX >= 0 && GridX < MazeSize.X &&
 			((EntranceDoor.X == GridX && EntranceDoor.Y == MazeSize.Y - 1) || (ExitDoor.X == GridX && ExitDoor.Y == MazeSize.Y - 1));
 		if (!bSkipSouthWall)
 		{
-			OutlineWallCells->AddInstance(FTransform{Location2});
+			OutlineWallCells->AddInstance(FTransform{FRotator::ZeroRotator, Location2, OutlineScale});
 		}
 	}
 
@@ -377,20 +586,29 @@ void AMaze::CreateMazeOutline() const
 			((EntranceDoor.X == 0 && EntranceDoor.Y == GridY) || (ExitDoor.X == 0 && ExitDoor.Y == GridY));
 		if (!bSkipWestWall)
 		{
-			OutlineWallCells->AddInstance(FTransform{Location1});
+			OutlineWallCells->AddInstance(FTransform{FRotator::ZeroRotator, Location1, OutlineScale});
 		}
 
 		bool bSkipEastWall = bCreateDoors && GridY >= 0 && GridY < MazeSize.Y &&
 			((EntranceDoor.X == MazeSize.X - 1 && EntranceDoor.Y == GridY) || (ExitDoor.X == MazeSize.X - 1 && ExitDoor.Y == GridY));
 		if (!bSkipEastWall)
 		{
-			OutlineWallCells->AddInstance(FTransform{Location2});
+			OutlineWallCells->AddInstance(FTransform{FRotator::ZeroRotator, Location2, OutlineScale});
 		}
+	}
+
+	if (bCreateDoors)
+	{
+		UE_LOG(LogMaze, Log, TEXT("  Created outline with doors at Entrance(%d,%d) and Exit(%d,%d)"),
+			EntranceDoor.X, EntranceDoor.Y, ExitDoor.X, ExitDoor.Y);
 	}
 }
 
 TArray<TArray<uint8>> AMaze::GetMazePath(const FMazeCoordinates& Start, const FMazeCoordinates& End, int32& OutLength)
 {
+	UE_LOG(LogMaze, Log, TEXT("GetMazePath: Finding path from (%d,%d) to (%d,%d) in %dx%d maze"),
+		Start.X, Start.Y, End.X, End.Y, MazeSize.X, MazeSize.Y);
+
 	TArray<TArray<int32>> Graph;
 	Graph.Reserve(MazeGrid.Num() * MazeGrid[0].Num());
 
@@ -468,9 +686,13 @@ TArray<TArray<uint8>> AMaze::GetMazePath(const FMazeCoordinates& Start, const FM
 	TArray<int32> GraphPath;
 	if (!Visited[EndVertex])
 	{
-		UE_LOG(LogMaze, Warning, TEXT("Path is not reachable."));
+		UE_LOG(LogMaze, Error, TEXT("  FAILED: Path is not reachable from (%d,%d) to (%d,%d)"),
+			Start.X, Start.Y, End.X, End.Y);
+		OutLength = 0;
 		return TArray<TArray<uint8>>();
 	}
+
+	UE_LOG(LogMaze, Log, TEXT("  BFS complete: Building path from visited vertices"));
 
 	for (int VertexNumber = EndVertex; VertexNumber != -1; VertexNumber = Parents[VertexNumber])
 	{
@@ -495,22 +717,43 @@ TArray<TArray<uint8>> AMaze::GetMazePath(const FMazeCoordinates& Start, const FM
 
 
 	OutLength = Distances[EndVertex] + 1;
+	UE_LOG(LogMaze, Log, TEXT("  SUCCESS: Path found with length %d"), OutLength);
 	return Path;
 }
 
 void AMaze::EnableCollision(const bool bShouldEnable)
 {
+	UE_LOG(LogMaze, Log, TEXT("EnableCollision: %s collision"), bShouldEnable ? TEXT("Enabling") : TEXT("Disabling"));
+
 	if (bShouldEnable)
 	{
 		FloorCells->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
-		WallCells->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+
+		// Enable collision for all wall mesh array components
+		for (UHierarchicalInstancedStaticMeshComponent* WallComponent : WallCellsArray)
+		{
+			if (WallComponent)
+			{
+				WallComponent->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+			}
+		}
+
 		OutlineWallCells->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
 		PathFloorCells->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
 	}
 	else
 	{
 		FloorCells->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-		WallCells->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+
+		// Disable collision for all wall mesh array components
+		for (UHierarchicalInstancedStaticMeshComponent* WallComponent : WallCellsArray)
+		{
+			if (WallComponent)
+			{
+				WallComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+			}
+		}
+
 		OutlineWallCells->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 		PathFloorCells->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 	}
@@ -519,14 +762,26 @@ void AMaze::EnableCollision(const bool bShouldEnable)
 
 void AMaze::ClearMaze()
 {
+	UE_LOG(LogMaze, Log, TEXT("ClearMaze: Clearing all instances from components"));
+
 	if (FloorCells)
 	{
 		FloorCells->ClearInstances();
 	}
-	if (WallCells)
+
+	// Clear instances from all wall mesh array components (but don't destroy them - reuse)
+	int32 WallComponentsCleared = 0;
+	for (UHierarchicalInstancedStaticMeshComponent* WallComponent : WallCellsArray)
 	{
-		WallCells->ClearInstances();
+		if (WallComponent)
+		{
+			WallComponent->ClearInstances();
+			WallComponentsCleared++;
+		}
 	}
+	UE_LOG(LogMaze, Log, TEXT("  Cleared %d wall components"), WallComponentsCleared);
+	// Don't empty the array - we'll reuse these components
+
 	if (OutlineWallCells)
 	{
 		OutlineWallCells->ClearInstances();
@@ -535,10 +790,15 @@ void AMaze::ClearMaze()
 	{
 		PathFloorCells->ClearInstances();
 	}
+	if (DebugFloorOutlines)
+	{
+		DebugFloorOutlines->ClearInstances();
+	}
 
 	// Destroy previously spawned endpoint actor
 	if (SpawnedEndpointActor && IsValid(SpawnedEndpointActor))
 	{
+		UE_LOG(LogMaze, Log, TEXT("  Destroying previous endpoint actor '%s'"), *SpawnedEndpointActor->GetName());
 		SpawnedEndpointActor->Destroy();
 		SpawnedEndpointActor = nullptr;
 	}
@@ -547,12 +807,21 @@ void AMaze::ClearMaze()
 FVector2D AMaze::GetMaxCellSize() const
 {
 	const FVector FloorSize3D = FloorStaticMesh->GetBoundingBox().GetSize();
-	const FVector WallSize3D = WallStaticMesh->GetBoundingBox().GetSize();
-
 	const FVector2D FloorSize2D{FloorSize3D.X, FloorSize3D.Y};
-	const FVector2D WallSize2D{WallSize3D.X, WallSize3D.Y};
 
-	const FVector2D MaxCellSize = FVector2D::Max(FloorSize2D, WallSize2D);
+	FVector2D MaxCellSize = FloorSize2D;
+
+	// Check all wall meshes in the array
+	for (UStaticMesh* WallMesh : WallStaticMeshes)
+	{
+		if (WallMesh)
+		{
+			const FVector WallSize3D = WallMesh->GetBoundingBox().GetSize();
+			const FVector2D WallSize2D{WallSize3D.X, WallSize3D.Y};
+			MaxCellSize = FVector2D::Max(MaxCellSize, WallSize2D);
+		}
+	}
+
 	if (OutlineStaticMesh)
 	{
 		const FVector OutlineSize3D = OutlineStaticMesh->GetBoundingBox().GetSize();
@@ -567,6 +836,8 @@ FVector2D AMaze::GetMaxCellSize() const
 
 void AMaze::Randomize()
 {
+	UE_LOG(LogMaze, Log, TEXT("=== Randomize START ==="));
+
 	MazeSize.X = FMath::RandRange(3, 101) | 1; // | 1 to make odd.
 	MazeSize.Y = FMath::RandRange(3, 101) | 1;
 
@@ -575,6 +846,10 @@ void AMaze::Randomize()
 	GenerationAlgorithm = Algorithms[FMath::RandRange(0, Num - 1)];
 
 	Seed = FMath::RandRange(MIN_int32, MAX_int32);
+
+	UE_LOG(LogMaze, Log, TEXT("  Randomized MazeSize: %dx%d"), MazeSize.X, MazeSize.Y);
+	UE_LOG(LogMaze, Log, TEXT("  Randomized Algorithm: %d"), (int32)GenerationAlgorithm);
+	UE_LOG(LogMaze, Log, TEXT("  Randomized Seed: %d"), Seed);
 
 	if (bForceEdgeDoors)
 	{
@@ -639,11 +914,14 @@ void AMaze::Randomize()
 			} while (EndIndex == StartIndex && EdgeFloorPositions.Num() > 1);
 
 			PathEnd = EdgeFloorPositions[EndIndex];
+			UE_LOG(LogMaze, Log, TEXT("  Randomized PathStart: (%d,%d), PathEnd: (%d,%d) from %d edge floors"),
+				PathStart.X, PathStart.Y, PathEnd.X, PathEnd.Y, EdgeFloorPositions.Num());
 		}
 		else
 		{
 			// Fallback to corners if not enough edge floors found
-			UE_LOG(LogMaze, Warning, TEXT("Not enough floor cells on edges. Using corners."));
+			UE_LOG(LogMaze, Warning, TEXT("  Not enough floor cells on edges (%d found). Using corners."),
+				EdgeFloorPositions.Num());
 			PathStart.X = 0;
 			PathStart.Y = 0;
 			PathEnd.X = MazeSize.X - 1;
@@ -657,18 +935,23 @@ void AMaze::Randomize()
 		PathStart.Y = 0;
 		PathEnd.X = MazeSize.X - 1;
 		PathEnd.Y = MazeSize.Y - 1;
+		UE_LOG(LogMaze, Log, TEXT("  Using corner positions for PathStart and PathEnd (bForceEdgeDoors=false)"));
 	}
 
+	UE_LOG(LogMaze, Log, TEXT("=== Randomize COMPLETE - calling UpdateMaze ==="));
 	UpdateMaze();
 }
 
 
 TArray<FVector> AMaze::GetRandomFloorLocations(int32 Count)
 {
+	UE_LOG(LogMaze, Log, TEXT("GetRandomFloorLocations: Requested %d locations"), Count);
+
 	TArray<FVector> AllFloorLocations = GetAllFloorLocations();
 
 	if (Count >= AllFloorLocations.Num())
 	{
+		UE_LOG(LogMaze, Warning, TEXT("  Requested %d but only %d available - returning all"), Count, AllFloorLocations.Num());
 		return AllFloorLocations;
 	}
 
@@ -687,6 +970,7 @@ TArray<FVector> AMaze::GetRandomFloorLocations(int32 Count)
 		RandomLocations.Add(AllFloorLocations[i]);
 	}
 
+	UE_LOG(LogMaze, Log, TEXT("  Returning %d random floor locations"), RandomLocations.Num());
 	return RandomLocations;
 }
 
@@ -700,13 +984,19 @@ TArray<FVector> AMaze::GetAllFloorLocations()
 		return FloorLocations;
 	}
 
-	UE_LOG(LogMaze, Log, TEXT("GetAllFloorLocations: MazeGrid size is %dx%d"), MazeSize.X, MazeSize.Y);
+	UE_LOG(LogMaze, Log, TEXT("GetAllFloorLocations: MazeGrid size is %dx%d, SpawnGridSubdivisions=%d"),
+		MazeSize.X, MazeSize.Y, SpawnGridSubdivisions);
 
-	// Reserve space accounting for FloorWidth (each logical cell has FloorWidth^2 physical tiles)
-	FloorLocations.Reserve(MazeSize.X * MazeSize.Y * FloorWidth * FloorWidth / 2);
+	// Calculate total spawn locations: grid cells * FloorWidth * subdivisions
+	const int32 TotalSubdivisions = FloorWidth * SpawnGridSubdivisions;
+	FloorLocations.Reserve(MazeSize.X * MazeSize.Y * TotalSubdivisions * TotalSubdivisions / 2);
 
 	// Calculate the scaled cell size based on floor width
 	const FVector2D ScaledCellSize = MazeCellSize * FloorWidth;
+
+	// Calculate spawn point spacing
+	const float SpawnSpacingX = MazeCellSize.X / SpawnGridSubdivisions;
+	const float SpawnSpacingY = MazeCellSize.Y / SpawnGridSubdivisions;
 
 	const FTransform& ActorTransform = GetActorTransform();
 
@@ -717,15 +1007,15 @@ TArray<FVector> AMaze::GetAllFloorLocations()
 			// Check if this is a floor cell (value = 1)
 			if (MazeGrid[Y][X])
 			{
-				// For each logical floor cell, return all physical floor tile positions
-				for (int32 FY = 0; FY < FloorWidth; ++FY)
+				// For each logical floor cell, subdivide it into spawn grid
+				for (int32 FY = 0; FY < TotalSubdivisions; ++FY)
 				{
-					for (int32 FX = 0; FX < FloorWidth; ++FX)
+					for (int32 FX = 0; FX < TotalSubdivisions; ++FX)
 					{
-						// Calculate position of each physical floor tile
+						// Calculate position within subdivided grid
 						const FVector LocalPosition(
-							ScaledCellSize.X * X + MazeCellSize.X * FX + (MazeCellSize.X * 0.5f),
-							ScaledCellSize.Y * Y + MazeCellSize.Y * FY + (MazeCellSize.Y * 0.5f),
+							ScaledCellSize.X * X + SpawnSpacingX * FX + (SpawnSpacingX * 0.5f),
+							ScaledCellSize.Y * Y + SpawnSpacingY * FY + (SpawnSpacingY * 0.5f),
 							0.f);
 
 						// Transform to world space
@@ -745,6 +1035,8 @@ TArray<FVector> AMaze::GetAllFloorLocations()
 
 FTransform AMaze::GetPathStartTransform()
 {
+	UE_LOG(LogMaze, Log, TEXT("GetPathStartTransform: PathStart at (%d,%d)"), PathStart.X, PathStart.Y);
+
 	// Calculate the scaled cell size based on floor width
 	const FVector2D ScaledCellSize = MazeCellSize * FloorWidth;
 
@@ -786,11 +1078,16 @@ FTransform AMaze::GetPathStartTransform()
 	FTransform LocalTransform(Rotation, LocalPosition);
 
 	// Transform to world space
-	return LocalTransform * GetActorTransform();
+	FTransform WorldTransform = LocalTransform * GetActorTransform();
+	UE_LOG(LogMaze, Log, TEXT("  World position: %s, Rotation: %s"),
+		*WorldTransform.GetLocation().ToString(), *WorldTransform.Rotator().ToString());
+	return WorldTransform;
 }
 
 FTransform AMaze::GetPathEndTransform()
 {
+	UE_LOG(LogMaze, Log, TEXT("GetPathEndTransform: PathEnd at (%d,%d)"), PathEnd.X, PathEnd.Y);
+
 	// Calculate the scaled cell size based on floor width
 	const FVector2D ScaledCellSize = MazeCellSize * FloorWidth;
 
@@ -832,11 +1129,15 @@ FTransform AMaze::GetPathEndTransform()
 	FTransform LocalTransform(Rotation, LocalPosition);
 
 	// Transform to world space
-	return LocalTransform * GetActorTransform();
+	FTransform WorldTransform = LocalTransform * GetActorTransform();
+	UE_LOG(LogMaze, Log, TEXT("  World position: %s, Rotation: %s"),
+		*WorldTransform.GetLocation().ToString(), *WorldTransform.Rotator().ToString());
+	return WorldTransform;
 }
 
 FTransform AMaze::GetMazeEndpointTransform()
 {
+	UE_LOG(LogMaze, Log, TEXT("GetMazeEndpointTransform: Endpoint at (%d,%d)"), MazeEndpoint.X, MazeEndpoint.Y);
 	if (!bHasEndpoint)
 	{
 		UE_LOG(LogMaze, Warning, TEXT("GetMazeEndpointTransform called but bHasEndpoint is false!"));
@@ -884,20 +1185,25 @@ FTransform AMaze::GetMazeEndpointTransform()
 	FTransform LocalTransform(Rotation, LocalPosition);
 
 	// Transform to world space
-	return LocalTransform * GetActorTransform();
+	FTransform WorldTransform = LocalTransform * GetActorTransform();
+	UE_LOG(LogMaze, Log, TEXT("  World position: %s, Rotation: %s"),
+		*WorldTransform.GetLocation().ToString(), *WorldTransform.Rotator().ToString());
+	return WorldTransform;
 }
 
 AActor* AMaze::SpawnEndpointActor()
 {
+	UE_LOG(LogMaze, Log, TEXT("SpawnEndpointActor called"));
+
 	if (!bHasEndpoint)
 	{
-		UE_LOG(LogMaze, Warning, TEXT("SpawnEndpointActor called but bHasEndpoint is false!"));
+		UE_LOG(LogMaze, Warning, TEXT("  FAILED: bHasEndpoint is false"));
 		return nullptr;
 	}
 
 	if (!EndpointActorClass)
 	{
-		UE_LOG(LogMaze, Warning, TEXT("SpawnEndpointActor called but EndpointActorClass is not set!"));
+		UE_LOG(LogMaze, Warning, TEXT("  FAILED: EndpointActorClass is not set"));
 		return nullptr;
 	}
 
@@ -905,13 +1211,14 @@ AActor* AMaze::SpawnEndpointActor()
 	UWorld* World = GetWorld();
 	if (!World)
 	{
-		UE_LOG(LogMaze, Error, TEXT("SpawnEndpointActor: World is null!"));
+		UE_LOG(LogMaze, Error, TEXT("  FAILED: World is null!"));
 		return nullptr;
 	}
 
 	// Destroy existing endpoint actor if any
 	if (SpawnedEndpointActor && IsValid(SpawnedEndpointActor))
 	{
+		UE_LOG(LogMaze, Log, TEXT("  Destroying existing endpoint actor: %s"), *SpawnedEndpointActor->GetName());
 		SpawnedEndpointActor->Destroy();
 		SpawnedEndpointActor = nullptr;
 	}
@@ -924,18 +1231,19 @@ AActor* AMaze::SpawnEndpointActor()
 	SpawnParams.Owner = this;
 	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 
+	UE_LOG(LogMaze, Log, TEXT("  Spawning %s at location (%s)"),
+		*EndpointActorClass->GetName(),
+		*EndpointTransform.GetLocation().ToString());
+
 	SpawnedEndpointActor = World->SpawnActor<AActor>(EndpointActorClass, EndpointTransform, SpawnParams);
 
 	if (SpawnedEndpointActor)
 	{
-		UE_LOG(LogMaze, Log, TEXT("Spawned endpoint actor '%s' at (%s)"),
-			*SpawnedEndpointActor->GetName(),
-			*EndpointTransform.GetLocation().ToString());
+		UE_LOG(LogMaze, Log, TEXT("  SUCCESS: Spawned endpoint actor '%s'"), *SpawnedEndpointActor->GetName());
 	}
 	else
 	{
-		UE_LOG(LogMaze, Error, TEXT("Failed to spawn endpoint actor of class '%s'!"),
-			*EndpointActorClass->GetName());
+		UE_LOG(LogMaze, Error, TEXT("  FAILED: Could not spawn endpoint actor!"));
 	}
 
 	return SpawnedEndpointActor;
@@ -943,13 +1251,17 @@ AActor* AMaze::SpawnEndpointActor()
 
 FTransform AMaze::GetRandomSpawnTransform()
 {
+	UE_LOG(LogMaze, Log, TEXT("GetRandomSpawnTransform: Getting random spawn location"));
+
 	TArray<FVector> FloorLocations = GetRandomFloorLocations(1);
 
 	if (FloorLocations.Num() == 0)
 	{
-		UE_LOG(LogMaze, Warning, TEXT("GetRandomSpawnTransform: No floor locations available!"));
+		UE_LOG(LogMaze, Warning, TEXT("  No floor locations available - returning actor transform"));
 		return GetActorTransform();
 	}
+
+	UE_LOG(LogMaze, Log, TEXT("  Random spawn at: %s"), *FloorLocations[0].ToString());
 
 	// Return transform at random floor location with default rotation
 	return FTransform(FRotator::ZeroRotator, FloorLocations[0]);
@@ -957,10 +1269,14 @@ FTransform AMaze::GetRandomSpawnTransform()
 
 TArray<FVector> AMaze::GetRandomFloorLocationsExcluding(int32 Count, const TArray<FVector>& ExcludePositions, float ExclusionRadius)
 {
+	UE_LOG(LogMaze, Log, TEXT("GetRandomFloorLocationsExcluding: Requested %d locations, excluding %d positions with radius %.1f"),
+		Count, ExcludePositions.Num(), ExclusionRadius);
+
 	TArray<FVector> AllFloorLocations = GetAllFloorLocations();
 	TArray<FVector> ValidLocations;
 
 	// Filter out locations that are too close to excluded positions
+	int32 ExcludedCount = 0;
 	for (const FVector& FloorLocation : AllFloorLocations)
 	{
 		bool bTooClose = false;
@@ -973,6 +1289,7 @@ TArray<FVector> AMaze::GetRandomFloorLocationsExcluding(int32 Count, const TArra
 			if (DistanceSquared < RadiusSquared)
 			{
 				bTooClose = true;
+				ExcludedCount++;
 				break;
 			}
 		}
@@ -983,16 +1300,19 @@ TArray<FVector> AMaze::GetRandomFloorLocationsExcluding(int32 Count, const TArra
 		}
 	}
 
+	UE_LOG(LogMaze, Log, TEXT("  Filtered: %d total, %d excluded, %d valid"),
+		AllFloorLocations.Num(), ExcludedCount, ValidLocations.Num());
+
 	if (ValidLocations.Num() == 0)
 	{
-		UE_LOG(LogMaze, Warning, TEXT("GetRandomFloorLocationsExcluding: No valid locations found after exclusion!"));
+		UE_LOG(LogMaze, Error, TEXT("  FAILED: No valid locations found after exclusion!"));
 		return TArray<FVector>();
 	}
 
 	// Return all valid locations if requested count exceeds available
 	if (Count >= ValidLocations.Num())
 	{
-		UE_LOG(LogMaze, Log, TEXT("GetRandomFloorLocationsExcluding: Requested %d, returning all %d valid locations"), Count, ValidLocations.Num());
+		UE_LOG(LogMaze, Warning, TEXT("  Requested %d but only %d valid - returning all"), Count, ValidLocations.Num());
 		return ValidLocations;
 	}
 
@@ -1013,7 +1333,7 @@ TArray<FVector> AMaze::GetRandomFloorLocationsExcluding(int32 Count, const TArra
 		RandomLocations.Add(ValidLocations[i]);
 	}
 
-	UE_LOG(LogMaze, Log, TEXT("GetRandomFloorLocationsExcluding: Returning %d random locations"), RandomLocations.Num());
+	UE_LOG(LogMaze, Log, TEXT("  Returning %d random locations"), RandomLocations.Num());
 	return RandomLocations;
 }
 
@@ -1021,8 +1341,23 @@ void AMaze::BeginPlay()
 {
 	Super::BeginPlay();
 
+	UE_LOG(LogMaze, Log, TEXT("BeginPlay: Regenerating maze at runtime for actor %s"), *GetName());
+
 	// Regenerate the maze at runtime since MazeGrid is not serialized
 	UpdateMaze();
+}
+
+void AMaze::PostLoad()
+{
+	Super::PostLoad();
+
+	// Migrate old WallStaticMesh to new WallStaticMeshes array
+	if (WallStaticMesh_DEPRECATED != nullptr && WallStaticMeshes.Num() == 0)
+	{
+		WallStaticMeshes.Add(WallStaticMesh_DEPRECATED);
+		WallStaticMesh_DEPRECATED = nullptr;
+		UE_LOG(LogMaze, Log, TEXT("Migrated WallStaticMesh to WallStaticMeshes array"));
+	}
 }
 
 void AMaze::OnConstruction(const FTransform& Transform)
@@ -1032,9 +1367,14 @@ void AMaze::OnConstruction(const FTransform& Transform)
 #if WITH_EDITOR
 	if (Transform.Equals(LastMazeTransform))
 	{
+		UE_LOG(LogMaze, Log, TEXT("OnConstruction: Transform unchanged - regenerating maze for actor %s"), *GetName());
 #endif
 		UpdateMaze();
 #if WITH_EDITOR
+	}
+	else
+	{
+		UE_LOG(LogMaze, Log, TEXT("OnConstruction: Transform changed - skipping maze regeneration"));
 	}
 	LastMazeTransform = Transform;
 #endif
