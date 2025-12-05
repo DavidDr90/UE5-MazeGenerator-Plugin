@@ -21,6 +21,13 @@ enum class EGenerationAlgorithm : uint8
 	Prim
 };
 
+UENUM(BlueprintType)
+enum class EMazeGameMode : uint8
+{
+	FindTheFlag UMETA(DisplayName="Find The Flag", ToolTip="Player and goal spawn randomly anywhere in the maze"),
+	NavigateMaze UMETA(DisplayName="Navigate Maze", ToolTip="Player starts at entrance, goal at exit, both on opposite edges with visual doors")
+};
+
 USTRUCT(BlueprintType)
 struct FMazeSize
 {
@@ -78,6 +85,10 @@ public:
 		meta=(NoResetToDefault, ExposeOnSpawn, DisplayPriority=0))
 	EGenerationAlgorithm GenerationAlgorithm;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Maze|Game Mode",
+		meta=(NoResetToDefault, ExposeOnSpawn, DisplayPriority=0))
+	EMazeGameMode GameMode;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Maze", meta=(ExposeOnSpawn, DisplayPriority=1))
 	int32 Seed;
 
@@ -100,6 +111,26 @@ public:
 		meta=(ExposeOnSpawn, DisplayPriority=2))
 	UStaticMesh* OutlineStaticMesh;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Maze|Game Mode",
+		meta=(ExposeOnSpawn, EditCondition="GameMode == EMazeGameMode::NavigateMaze", EditConditionHides,
+		ToolTip="Visual marker actor to spawn at maze entrance (optional)"))
+	TSubclassOf<AActor> EntranceActorClass;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Maze|Game Mode",
+		meta=(ExposeOnSpawn, EditCondition="GameMode == EMazeGameMode::NavigateMaze", EditConditionHides,
+		ToolTip="Visual marker actor to spawn at maze exit (optional)"))
+	TSubclassOf<AActor> ExitActorClass;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Maze|Game Mode|Doors",
+		meta=(ExposeOnSpawn, EditCondition="GameMode == EMazeGameMode::NavigateMaze", EditConditionHides,
+		ToolTip="Door actor to spawn at entrance with collision/trigger logic"))
+	TSubclassOf<AActor> EntranceDoorActorClass;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Maze|Game Mode|Doors",
+		meta=(ExposeOnSpawn, EditCondition="GameMode == EMazeGameMode::NavigateMaze", EditConditionHides,
+		ToolTip="Door actor to spawn at exit with collision/trigger logic"))
+	TSubclassOf<AActor> ExitDoorActorClass;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Maze|Endpoint", meta=(ExposeOnSpawn))
 	bool bHasEndpoint = false;
 
@@ -115,11 +146,13 @@ public:
 	bool bGeneratePath = false;
 
 	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category="Maze|Pathfinder",
-		meta=(ExposeOnSpawn, EditCondition="bGeneratePath", EditConditionHides))
+		meta=(ExposeOnSpawn, EditCondition="bGeneratePath && GameMode == EMazeGameMode::FindTheFlag", EditConditionHides,
+		ToolTip="Path start coordinates (auto-set in NavigateMaze mode)"))
 	FMazeCoordinates PathStart;
 
 	UPROPERTY(EditInstanceOnly, BlueprintReadWrite, Category="Maze|Pathfinder",
-		meta=(ExposeOnSpawn, EditCondition="bGeneratePath", EditConditionHides))
+		meta=(ExposeOnSpawn, EditCondition="bGeneratePath && GameMode == EMazeGameMode::FindTheFlag", EditConditionHides,
+		ToolTip="Path end coordinates (auto-set in NavigateMaze mode)"))
 	FMazeCoordinates PathEnd;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Maze|Doors", meta=(ExposeOnSpawn))
@@ -205,6 +238,24 @@ protected:
 	UPROPERTY()
 	AActor* SpawnedEndpointActor;
 
+	UPROPERTY()
+	AActor* SpawnedEntranceActor;
+
+	UPROPERTY()
+	AActor* SpawnedExitActor;
+
+	UPROPERTY()
+	AActor* SpawnedEntranceDoorActor;
+
+	UPROPERTY()
+	AActor* SpawnedExitDoorActor;
+
+	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category="Maze|Game Mode")
+	FMazeCoordinates MazeEntrance;
+
+	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category="Maze|Game Mode")
+	FMazeCoordinates MazeExit;
+
 	UPROPERTY(VisibleInstanceOnly, BlueprintReadOnly, Category="Maze|Cells")
 	FVector2D MazeCellSize;	
 
@@ -279,6 +330,79 @@ public:
 	virtual FTransform GetPathEndTransform();
 
 	/**
+	 * Returns the maze entrance position and rotation in world space.
+	 * Used in NavigateMaze mode - entrance is on a maze edge.
+	 * @return Transform with position and rotation facing into the maze
+	 */
+	UFUNCTION(BlueprintCallable, Category="Maze")
+	virtual FTransform GetMazeEntranceTransform();
+
+	/**
+	 * Returns the maze exit position and rotation in world space.
+	 * Used in NavigateMaze mode - exit is on opposite edge from entrance.
+	 * @return Transform with position and rotation facing into the maze
+	 */
+	UFUNCTION(BlueprintCallable, Category="Maze")
+	virtual FTransform GetMazeExitTransform();
+
+	/**
+	 * Spawns the entrance actor at the maze entrance location.
+	 * Only used in NavigateMaze mode.
+	 * @return Pointer to the spawned entrance actor
+	 */
+	UFUNCTION(BlueprintCallable, Category="Maze")
+	virtual AActor* SpawnEntranceActor();
+
+	/**
+	 * Spawns the exit actor at the maze exit location.
+	 * Only used in NavigateMaze mode.
+	 * @return Pointer to the spawned exit actor
+	 */
+	UFUNCTION(BlueprintCallable, Category="Maze")
+	virtual AActor* SpawnExitActor();
+
+	/**
+	 * Returns a spawn transform for the player based on current game mode.
+	 * In FindTheFlag mode: random floor location
+	 * In NavigateMaze mode: at the entrance
+	 * @return Transform for player spawn
+	 */
+	UFUNCTION(BlueprintCallable, Category="Maze")
+	virtual FTransform GetPlayerSpawnTransform();
+
+	/**
+	 * Spawns the entrance door actor at the maze entrance location.
+	 * Only used in NavigateMaze mode. Door should face into the maze.
+	 * @return Pointer to the spawned entrance door actor
+	 */
+	UFUNCTION(BlueprintCallable, Category="Maze")
+	virtual AActor* SpawnEntranceDoorActor();
+
+	/**
+	 * Spawns the exit door actor at the maze exit location.
+	 * Only used in NavigateMaze mode. Door should face into the maze.
+	 * @return Pointer to the spawned exit door actor
+	 */
+	UFUNCTION(BlueprintCallable, Category="Maze")
+	virtual AActor* SpawnExitDoorActor();
+
+	/**
+	 * Returns the entrance door transform (position and rotation).
+	 * Position is at the entrance doorway, rotation faces into the maze.
+	 * @return Transform for entrance door placement
+	 */
+	UFUNCTION(BlueprintCallable, Category="Maze")
+	virtual FTransform GetEntranceDoorTransform();
+
+	/**
+	 * Returns the exit door transform (position and rotation).
+	 * Position is at the exit doorway, rotation faces into the maze.
+	 * @return Transform for exit door placement
+	 */
+	UFUNCTION(BlueprintCallable, Category="Maze")
+	virtual FTransform GetExitDoorTransform();
+
+	/**
 	 * Updates Maze every time any parameter has been changed(except transform).
 	 *
 	 * Remember: this method is being called before BeginPlay.
@@ -300,14 +424,16 @@ public:
 	 * Returns path grid mapped into MazeGrid constrains. Creates a graph every time it is called.
 	 *
 	 * Note :
-	 * 
+	 *
 	 * Optimization is possible:
 	 * if the beginning or end has not changed, there is actually no need to create a new graph,
 	 * but due to the many parameters that can be changed, it is difficult to determine what exactly has changed,
 	 * so this optimization has been neglected.
+	 *
+	 * @param bSilent - If true, suppress logging (useful when testing multiple paths)
 	 */
 	virtual TArray<TArray<uint8>> GetMazePath(const FMazeCoordinates& Start, const FMazeCoordinates& End,
-	                                          int32& OutLength);
+	                                          int32& OutLength, bool bSilent = false);
 protected:
 	/**
 	 * Generate Maze with random size, seed and 

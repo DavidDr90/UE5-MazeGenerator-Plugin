@@ -106,6 +106,11 @@ AMaze::AMaze()
 	}
 
 	SpawnedEndpointActor = nullptr;
+	SpawnedEntranceActor = nullptr;
+	SpawnedExitActor = nullptr;
+	SpawnedEntranceDoorActor = nullptr;
+	SpawnedExitDoorActor = nullptr;
+	GameMode = EMazeGameMode::FindTheFlag;
 }
 
 void AMaze::UpdateMaze()
@@ -272,88 +277,227 @@ void AMaze::UpdateMaze()
 
 	MazeCellSize = GetMaxCellSize();
 
-	if (OutlineStaticMesh)
-	{
-		CreateMazeOutline();
-	}
 	MazeGrid = GenerationAlgorithms[GenerationAlgorithm]->GetGrid(MazeSize, Seed);
 
-	// Handle maze endpoint (independent of path generation)
-	if (bHasEndpoint)
+	// Handle game mode specific logic
+	if (GameMode == EMazeGameMode::FindTheFlag)
 	{
-		// Auto-select random edge floor position for endpoint
-		TArray<FMazeCoordinates> EdgeFloorPositions;
+		UE_LOG(LogMaze, Log, TEXT("Game Mode: Find The Flag"));
 
-		// Collect all floor cells on the edges
+		// Handle maze endpoint (can spawn anywhere)
+		if (bHasEndpoint)
+		{
+			// Collect ALL floor cells (interior + edge)
+			TArray<FMazeCoordinates> AllFloorPositions;
+
+			for (int32 Y = 0; Y < MazeSize.Y; ++Y)
+			{
+				for (int32 X = 0; X < MazeSize.X; ++X)
+				{
+					if (MazeGrid[Y][X] == 1) // Is floor
+					{
+						FMazeCoordinates Coord;
+						Coord.X = X;
+						Coord.Y = Y;
+						AllFloorPositions.Add(Coord);
+					}
+				}
+			}
+
+			// Pick a random floor position (anywhere)
+			if (AllFloorPositions.Num() > 0)
+			{
+				const int32 RandomIndex = FMath::RandRange(0, AllFloorPositions.Num() - 1);
+				MazeEndpoint = AllFloorPositions[RandomIndex];
+				UE_LOG(LogMaze, Log, TEXT("Auto-selected endpoint at: (%d,%d)"), MazeEndpoint.X, MazeEndpoint.Y);
+			}
+			else
+			{
+				// Fallback: use a corner
+				UE_LOG(LogMaze, Warning, TEXT("No floor positions found. Using corner as endpoint."));
+				MazeEndpoint.X = MazeSize.X - 1;
+				MazeEndpoint.Y = MazeSize.Y - 1;
+			}
+		}
+	}
+	else if (GameMode == EMazeGameMode::NavigateMaze)
+	{
+		UE_LOG(LogMaze, Log, TEXT("Game Mode: Navigate Maze"));
+
+		// Collect edge floor positions grouped by side
+		TArray<FMazeCoordinates> NorthEdgeFloors, SouthEdgeFloors, WestEdgeFloors, EastEdgeFloors;
+
+		// North edge (Y=0)
 		for (int32 X = 0; X < MazeSize.X; ++X)
 		{
-			// North edge (Y=0)
 			if (MazeGrid[0][X] == 1)
 			{
 				FMazeCoordinates Coord;
 				Coord.X = X;
 				Coord.Y = 0;
-				EdgeFloorPositions.Add(Coord);
+				NorthEdgeFloors.Add(Coord);
 			}
-			// South edge (Y=MazeSize.Y-1)
+		}
+
+		// South edge (Y=MazeSize.Y-1)
+		for (int32 X = 0; X < MazeSize.X; ++X)
+		{
 			if (MazeGrid[MazeSize.Y - 1][X] == 1)
 			{
 				FMazeCoordinates Coord;
 				Coord.X = X;
 				Coord.Y = MazeSize.Y - 1;
-				EdgeFloorPositions.Add(Coord);
+				SouthEdgeFloors.Add(Coord);
 			}
 		}
 
-		for (int32 Y = 1; Y < MazeSize.Y - 1; ++Y) // Skip corners already added
+		// West edge (X=0)
+		for (int32 Y = 0; Y < MazeSize.Y; ++Y)
 		{
-			// West edge (X=0)
 			if (MazeGrid[Y][0] == 1)
 			{
 				FMazeCoordinates Coord;
 				Coord.X = 0;
 				Coord.Y = Y;
-				EdgeFloorPositions.Add(Coord);
+				WestEdgeFloors.Add(Coord);
 			}
-			// East edge (X=MazeSize.X-1)
+		}
+
+		// East edge (X=MazeSize.X-1)
+		for (int32 Y = 0; Y < MazeSize.Y; ++Y)
+		{
 			if (MazeGrid[Y][MazeSize.X - 1] == 1)
 			{
 				FMazeCoordinates Coord;
 				Coord.X = MazeSize.X - 1;
 				Coord.Y = Y;
-				EdgeFloorPositions.Add(Coord);
+				EastEdgeFloors.Add(Coord);
 			}
 		}
 
-		// Pick a random edge floor position
-		if (EdgeFloorPositions.Num() > 0)
+		// Randomly choose entrance side, then pick opposite side for exit
+		TArray<TArray<FMazeCoordinates>*> AvailableSides;
+		TArray<int32> SideIndices; // 0=North, 1=South, 2=West, 3=East
+
+		if (NorthEdgeFloors.Num() > 0) { AvailableSides.Add(&NorthEdgeFloors); SideIndices.Add(0); }
+		if (SouthEdgeFloors.Num() > 0) { AvailableSides.Add(&SouthEdgeFloors); SideIndices.Add(1); }
+		if (WestEdgeFloors.Num() > 0) { AvailableSides.Add(&WestEdgeFloors); SideIndices.Add(2); }
+		if (EastEdgeFloors.Num() > 0) { AvailableSides.Add(&EastEdgeFloors); SideIndices.Add(3); }
+
+		if (AvailableSides.Num() >= 2)
 		{
-			const int32 RandomIndex = FMath::RandRange(0, EdgeFloorPositions.Num() - 1);
-			MazeEndpoint = EdgeFloorPositions[RandomIndex];
-			UE_LOG(LogMaze, Log, TEXT("Auto-selected endpoint at edge: (%d,%d)"), MazeEndpoint.X, MazeEndpoint.Y);
+			// Find the entrance/exit pair with the longest path
+			// We'll test multiple candidate pairs to find the maximum distance
+
+			int32 MaxPathLength = 0;
+			FMazeCoordinates BestEntrance;
+			FMazeCoordinates BestExit;
+			bool bFoundValidPath = false;
+
+			UE_LOG(LogMaze, Warning, TEXT("Searching for maximum path distance..."));
+
+			// Strategy: Sample multiple pairs and find the longest
+			// For performance, we'll sample up to 20 pairs (or all if fewer)
+			const int32 MaxSamples = 20;
+
+			// Collect all edge floor positions into one array
+			TArray<FMazeCoordinates> AllEdgeFloors;
+			AllEdgeFloors.Append(NorthEdgeFloors);
+			AllEdgeFloors.Append(SouthEdgeFloors);
+			AllEdgeFloors.Append(WestEdgeFloors);
+			AllEdgeFloors.Append(EastEdgeFloors);
+
+			// Try multiple random pairs
+			int32 NumSamples = FMath::Min(MaxSamples, AllEdgeFloors.Num() * AllEdgeFloors.Num() / 4);
+
+			for (int32 Sample = 0; Sample < NumSamples; ++Sample)
+			{
+				// Pick two random edge positions
+				FMazeCoordinates CandidateStart = AllEdgeFloors[FMath::RandRange(0, AllEdgeFloors.Num() - 1)];
+				FMazeCoordinates CandidateEnd = AllEdgeFloors[FMath::RandRange(0, AllEdgeFloors.Num() - 1)];
+
+				// Skip if same position
+				if (CandidateStart == CandidateEnd)
+				{
+					continue;
+				}
+
+				// Calculate path length for this pair (silent mode to avoid log spam)
+				int32 TestPathLength = 0;
+				TArray<TArray<uint8>> TestPath = GetMazePath(CandidateStart, CandidateEnd, TestPathLength, true);
+
+				// If this path is longer than our current best, remember it
+				if (TestPathLength > MaxPathLength)
+				{
+					MaxPathLength = TestPathLength;
+					BestEntrance = CandidateStart;
+					BestExit = CandidateEnd;
+					bFoundValidPath = true;
+				}
+			}
+
+			if (bFoundValidPath)
+			{
+				MazeEntrance = BestEntrance;
+				MazeExit = BestExit;
+				UE_LOG(LogMaze, Warning, TEXT("Found optimal path! Entrance at (%d,%d), Exit at (%d,%d), Length: %d"),
+					MazeEntrance.X, MazeEntrance.Y, MazeExit.X, MazeExit.Y, MaxPathLength);
+			}
+			else
+			{
+				// Fallback: use first available positions
+				UE_LOG(LogMaze, Warning, TEXT("Could not find valid path, using fallback positions"));
+				MazeEntrance = AllEdgeFloors[0];
+				MazeExit = AllEdgeFloors[AllEdgeFloors.Num() - 1];
+			}
+
+			// Auto-set doors at entrance/exit
+			if (bCreateDoors)
+			{
+				EntranceDoor = MazeEntrance;
+				ExitDoor = MazeExit;
+			}
+
+			// Auto-generate path from entrance to exit if enabled
+			if (bGeneratePath)
+			{
+				PathStart = MazeEntrance;
+				PathEnd = MazeExit;
+			}
 		}
 		else
 		{
-			// Fallback: use a corner
-			UE_LOG(LogMaze, Warning, TEXT("No edge floor positions found. Using corner as endpoint."));
-			MazeEndpoint.X = MazeSize.X - 1;
-			MazeEndpoint.Y = MazeSize.Y - 1;
-		}
+			// Fallback: use corners
+			UE_LOG(LogMaze, Warning, TEXT("Not enough edge floor positions. Using corners."));
+			MazeEntrance.X = 0;
+			MazeEntrance.Y = 0;
+			MazeExit.X = MazeSize.X - 1;
+			MazeExit.Y = MazeSize.Y - 1;
 
-		// Optionally auto-set exit door at endpoint
-		if (bCreateDoors && !bGeneratePath)
-		{
-			ExitDoor = MazeEndpoint;
-		}
+			if (bCreateDoors)
+			{
+				EntranceDoor = MazeEntrance;
+				ExitDoor = MazeExit;
+			}
 
-		// Spawn endpoint mesh if provided (done after maze generation loop)
-		// This will be done at the end of UpdateMaze after all cells are placed
+			if (bGeneratePath)
+			{
+				PathStart = MazeEntrance;
+				PathEnd = MazeExit;
+			}
+		}
 	}
 
 	if (bGeneratePath)
 	{
-		PathStart.ClampByMazeSize(MazeSize);
-		PathEnd.ClampByMazeSize(MazeSize);
+		// In NavigateMaze mode, ALWAYS use entrance/exit (already set above)
+		// In FindTheFlag mode, use manual PathStart/PathEnd
+		if (GameMode == EMazeGameMode::FindTheFlag)
+		{
+			PathStart.ClampByMazeSize(MazeSize);
+			PathEnd.ClampByMazeSize(MazeSize);
+		}
+		// For NavigateMaze, PathStart/PathEnd were already set to MazeEntrance/MazeExit above
 
 		// Debug: Check if start and end are on floor cells
 		bool bStartIsFloor = MazeGrid[PathStart.Y][PathStart.X] == 1;
@@ -362,10 +506,20 @@ void AMaze::UpdateMaze()
 			PathStart.X, PathStart.Y, bStartIsFloor ? TEXT("FLOOR") : TEXT("WALL"),
 			PathEnd.X, PathEnd.Y, bEndIsFloor ? TEXT("FLOOR") : TEXT("WALL"));
 
-		MazePathGrid = GetMazePath(PathStart, PathEnd, PathLength);
+		if (!bStartIsFloor || !bEndIsFloor)
+		{
+			UE_LOG(LogMaze, Error, TEXT("  Path generation FAILED: Start or End is not on a floor cell!"));
+			MazePathGrid = TArray<TArray<uint8>>();
+			PathLength = 0;
+		}
+		else
+		{
+			MazePathGrid = GetMazePath(PathStart, PathEnd, PathLength);
+			UE_LOG(LogMaze, Warning, TEXT("  Generated path with %d cells"), PathLength);
+		}
 
-		// Auto-set doors at path start and end if door creation is enabled
-		if (bCreateDoors)
+		// Auto-set doors at path start and end if door creation is enabled (only in FindTheFlag)
+		if (bCreateDoors && GameMode == EMazeGameMode::FindTheFlag)
 		{
 			EntranceDoor = PathStart;
 			ExitDoor = PathEnd;
@@ -381,9 +535,21 @@ void AMaze::UpdateMaze()
 		}
 	}
 
+	// Create maze outline AFTER entrance/exit have been determined
+	if (OutlineStaticMesh)
+	{
+		CreateMazeOutline();
+	}
+
 	// Calculate the scaled cell size based on floor width
 	const FVector2D ScaledCellSize = MazeCellSize * FloorWidth;
 	const FVector FloorScale(FloorWidth, FloorWidth, 1.0f);
+
+	// Debug path rendering
+	int32 PathCellsRendered = 0;
+	int32 PathGridSize = MazePathGrid.Num();
+	UE_LOG(LogMaze, Warning, TEXT("Starting cell rendering loop. MazePathGrid.Num() = %d, bGeneratePath = %d, PathStaticMesh = %s"),
+		PathGridSize, bGeneratePath, PathStaticMesh ? TEXT("SET") : TEXT("NULL"));
 
 	for (int32 Y = 0; Y < MazeSize.Y; ++Y)
 	{
@@ -401,6 +567,7 @@ void AMaze::UpdateMaze()
 				FTransform Transform(CenterLocation);
 				Transform.SetScale3D(FloorScale);
 				PathFloorCells->AddInstance(Transform);
+				PathCellsRendered++;
 			}
 			else if (MazeGrid[Y][X])
 			{
@@ -506,6 +673,8 @@ void AMaze::UpdateMaze()
 		}
 	}
 
+	UE_LOG(LogMaze, Warning, TEXT("Cell rendering complete. Path cells rendered: %d"), PathCellsRendered);
+
 	EnableCollision(bUseCollision);
 
 	// Log maze generation summary
@@ -519,17 +688,57 @@ void AMaze::UpdateMaze()
 		}
 	}
 	int32 TotalOutlineInstances = OutlineWallCells ? OutlineWallCells->GetInstanceCount() : 0;
+	int32 TotalPathInstances = PathFloorCells ? PathFloorCells->GetInstanceCount() : 0;
 	int32 TotalDebugInstances = (bShowFloorDebug && DebugFloorOutlines) ? DebugFloorOutlines->GetInstanceCount() : 0;
 
-	UE_LOG(LogMaze, Log, TEXT("=== UpdateMaze COMPLETE ==="));
-	UE_LOG(LogMaze, Log, TEXT("  Floor instances: %d"), TotalFloorInstances);
-	UE_LOG(LogMaze, Log, TEXT("  Wall instances: %d (across %d components)"), TotalWallInstances, WallCellsArray.Num());
-	UE_LOG(LogMaze, Log, TEXT("  Outline instances: %d"), TotalOutlineInstances);
+	UE_LOG(LogMaze, Warning, TEXT("=== UpdateMaze COMPLETE ==="));
+	UE_LOG(LogMaze, Warning, TEXT("  Floor instances: %d"), TotalFloorInstances);
+	UE_LOG(LogMaze, Warning, TEXT("  Wall instances: %d (across %d components)"), TotalWallInstances, WallCellsArray.Num());
+	UE_LOG(LogMaze, Warning, TEXT("  Outline instances: %d"), TotalOutlineInstances);
+	UE_LOG(LogMaze, Warning, TEXT("  Path instances: %d (PathLength: %d)"), TotalPathInstances, PathLength);
 	if (bShowFloorDebug)
 	{
 		UE_LOG(LogMaze, Log, TEXT("  Debug floor markers: %d"), TotalDebugInstances);
 	}
 	UE_LOG(LogMaze, Log, TEXT("  Total instances: %d"), TotalFloorInstances + TotalWallInstances + TotalOutlineInstances);
+
+	// Auto-spawn door actors if in NavigateMaze mode and classes are set
+	// Only spawn at runtime (not in editor during OnConstruction)
+	UWorld* World = GetWorld();
+	if (World && World->IsGameWorld())
+	{
+		if (GameMode == EMazeGameMode::NavigateMaze)
+		{
+			// Spawn entrance door if class is set
+			if (EntranceDoorActorClass)
+			{
+				SpawnEntranceDoorActor();
+			}
+
+			// Spawn exit door if class is set
+			if (ExitDoorActorClass)
+			{
+				SpawnExitDoorActor();
+			}
+
+			// Spawn entrance marker if class is set
+			if (EntranceActorClass)
+			{
+				SpawnEntranceActor();
+			}
+
+			// Spawn exit marker if class is set
+			if (ExitActorClass)
+			{
+				SpawnExitActor();
+			}
+		}
+		// Auto-spawn endpoint in FindTheFlag mode
+		else if (GameMode == EMazeGameMode::FindTheFlag && bHasEndpoint && EndpointActorClass)
+		{
+			SpawnEndpointActor();
+		}
+	}
 }
 
 void AMaze::CreateMazeOutline() const
@@ -556,16 +765,27 @@ void AMaze::CreateMazeOutline() const
 		Location1.X = Location2.X = FX * MazeCellSize.X;
 
 		// Check if this position corresponds to a door
+		// Calculate which logical grid cell this physical position is in/near
 		int32 GridX = FX / FloorWidth;
-		bool bSkipNorthWall = bCreateDoors && GridX >= 0 && GridX < MazeSize.X &&
-			((EntranceDoor.X == GridX && EntranceDoor.Y == 0) || (ExitDoor.X == GridX && ExitDoor.Y == 0));
+
+		// Check if we're within the door's physical area (spans FloorWidth units)
+		bool bInEntranceNorthArea = bCreateDoors && EntranceDoor.Y == 0 &&
+			FX >= (EntranceDoor.X * FloorWidth) && FX < ((EntranceDoor.X + 1) * FloorWidth);
+		bool bInExitNorthArea = bCreateDoors && ExitDoor.Y == 0 &&
+			FX >= (ExitDoor.X * FloorWidth) && FX < ((ExitDoor.X + 1) * FloorWidth);
+
+		bool bSkipNorthWall = bInEntranceNorthArea || bInExitNorthArea;
 		if (!bSkipNorthWall)
 		{
 			OutlineWallCells->AddInstance(FTransform{FRotator::ZeroRotator, Location1, OutlineScale});
 		}
 
-		bool bSkipSouthWall = bCreateDoors && GridX >= 0 && GridX < MazeSize.X &&
-			((EntranceDoor.X == GridX && EntranceDoor.Y == MazeSize.Y - 1) || (ExitDoor.X == GridX && ExitDoor.Y == MazeSize.Y - 1));
+		bool bInEntranceSouthArea = bCreateDoors && EntranceDoor.Y == MazeSize.Y - 1 &&
+			FX >= (EntranceDoor.X * FloorWidth) && FX < ((EntranceDoor.X + 1) * FloorWidth);
+		bool bInExitSouthArea = bCreateDoors && ExitDoor.Y == MazeSize.Y - 1 &&
+			FX >= (ExitDoor.X * FloorWidth) && FX < ((ExitDoor.X + 1) * FloorWidth);
+
+		bool bSkipSouthWall = bInEntranceSouthArea || bInExitSouthArea;
 		if (!bSkipSouthWall)
 		{
 			OutlineWallCells->AddInstance(FTransform{FRotator::ZeroRotator, Location2, OutlineScale});
@@ -581,16 +801,27 @@ void AMaze::CreateMazeOutline() const
 		Location1.Y = Location2.Y = FY * MazeCellSize.Y;
 
 		// Check if this position corresponds to a door
+		// Calculate which logical grid cell this physical position is in/near
 		int32 GridY = FY / FloorWidth;
-		bool bSkipWestWall = bCreateDoors && GridY >= 0 && GridY < MazeSize.Y &&
-			((EntranceDoor.X == 0 && EntranceDoor.Y == GridY) || (ExitDoor.X == 0 && ExitDoor.Y == GridY));
+
+		// Check if we're within the door's physical area (spans FloorWidth units)
+		bool bInEntranceWestArea = bCreateDoors && EntranceDoor.X == 0 &&
+			FY >= (EntranceDoor.Y * FloorWidth) && FY < ((EntranceDoor.Y + 1) * FloorWidth);
+		bool bInExitWestArea = bCreateDoors && ExitDoor.X == 0 &&
+			FY >= (ExitDoor.Y * FloorWidth) && FY < ((ExitDoor.Y + 1) * FloorWidth);
+
+		bool bSkipWestWall = bInEntranceWestArea || bInExitWestArea;
 		if (!bSkipWestWall)
 		{
 			OutlineWallCells->AddInstance(FTransform{FRotator::ZeroRotator, Location1, OutlineScale});
 		}
 
-		bool bSkipEastWall = bCreateDoors && GridY >= 0 && GridY < MazeSize.Y &&
-			((EntranceDoor.X == MazeSize.X - 1 && EntranceDoor.Y == GridY) || (ExitDoor.X == MazeSize.X - 1 && ExitDoor.Y == GridY));
+		bool bInEntranceEastArea = bCreateDoors && EntranceDoor.X == MazeSize.X - 1 &&
+			FY >= (EntranceDoor.Y * FloorWidth) && FY < ((EntranceDoor.Y + 1) * FloorWidth);
+		bool bInExitEastArea = bCreateDoors && ExitDoor.X == MazeSize.X - 1 &&
+			FY >= (ExitDoor.Y * FloorWidth) && FY < ((ExitDoor.Y + 1) * FloorWidth);
+
+		bool bSkipEastWall = bInEntranceEastArea || bInExitEastArea;
 		if (!bSkipEastWall)
 		{
 			OutlineWallCells->AddInstance(FTransform{FRotator::ZeroRotator, Location2, OutlineScale});
@@ -599,15 +830,34 @@ void AMaze::CreateMazeOutline() const
 
 	if (bCreateDoors)
 	{
-		UE_LOG(LogMaze, Log, TEXT("  Created outline with doors at Entrance(%d,%d) and Exit(%d,%d)"),
+		UE_LOG(LogMaze, Warning, TEXT("  Created outline with doors at Entrance(%d,%d) and Exit(%d,%d)"),
 			EntranceDoor.X, EntranceDoor.Y, ExitDoor.X, ExitDoor.Y);
+
+		// Log which edges the doors are on
+		FString EntranceEdge = TEXT("Interior");
+		if (EntranceDoor.Y == 0) EntranceEdge = TEXT("North");
+		else if (EntranceDoor.Y == MazeSize.Y - 1) EntranceEdge = TEXT("South");
+		else if (EntranceDoor.X == 0) EntranceEdge = TEXT("West");
+		else if (EntranceDoor.X == MazeSize.X - 1) EntranceEdge = TEXT("East");
+
+		FString ExitEdge = TEXT("Interior");
+		if (ExitDoor.Y == 0) ExitEdge = TEXT("North");
+		else if (ExitDoor.Y == MazeSize.Y - 1) ExitEdge = TEXT("South");
+		else if (ExitDoor.X == 0) ExitEdge = TEXT("West");
+		else if (ExitDoor.X == MazeSize.X - 1) ExitEdge = TEXT("East");
+
+		UE_LOG(LogMaze, Warning, TEXT("  Entrance door on %s edge, Exit door on %s edge"),
+			*EntranceEdge, *ExitEdge);
 	}
 }
 
-TArray<TArray<uint8>> AMaze::GetMazePath(const FMazeCoordinates& Start, const FMazeCoordinates& End, int32& OutLength)
+TArray<TArray<uint8>> AMaze::GetMazePath(const FMazeCoordinates& Start, const FMazeCoordinates& End, int32& OutLength, bool bSilent)
 {
-	UE_LOG(LogMaze, Log, TEXT("GetMazePath: Finding path from (%d,%d) to (%d,%d) in %dx%d maze"),
-		Start.X, Start.Y, End.X, End.Y, MazeSize.X, MazeSize.Y);
+	if (!bSilent)
+	{
+		UE_LOG(LogMaze, Log, TEXT("GetMazePath: Finding path from (%d,%d) to (%d,%d) in %dx%d maze"),
+			Start.X, Start.Y, End.X, End.Y, MazeSize.X, MazeSize.Y);
+	}
 
 	TArray<TArray<int32>> Graph;
 	Graph.Reserve(MazeGrid.Num() * MazeGrid[0].Num());
@@ -686,13 +936,19 @@ TArray<TArray<uint8>> AMaze::GetMazePath(const FMazeCoordinates& Start, const FM
 	TArray<int32> GraphPath;
 	if (!Visited[EndVertex])
 	{
-		UE_LOG(LogMaze, Error, TEXT("  FAILED: Path is not reachable from (%d,%d) to (%d,%d)"),
-			Start.X, Start.Y, End.X, End.Y);
+		if (!bSilent)
+		{
+			UE_LOG(LogMaze, Error, TEXT("  FAILED: Path is not reachable from (%d,%d) to (%d,%d)"),
+				Start.X, Start.Y, End.X, End.Y);
+		}
 		OutLength = 0;
 		return TArray<TArray<uint8>>();
 	}
 
-	UE_LOG(LogMaze, Log, TEXT("  BFS complete: Building path from visited vertices"));
+	if (!bSilent)
+	{
+		UE_LOG(LogMaze, Log, TEXT("  BFS complete: Building path from visited vertices"));
+	}
 
 	for (int VertexNumber = EndVertex; VertexNumber != -1; VertexNumber = Parents[VertexNumber])
 	{
@@ -717,7 +973,26 @@ TArray<TArray<uint8>> AMaze::GetMazePath(const FMazeCoordinates& Start, const FM
 
 
 	OutLength = Distances[EndVertex] + 1;
-	UE_LOG(LogMaze, Log, TEXT("  SUCCESS: Path found with length %d"), OutLength);
+
+	if (!bSilent)
+	{
+		UE_LOG(LogMaze, Warning, TEXT("  SUCCESS: Path found with length %d, path cells marked in grid"), OutLength);
+
+		// Debug: Count how many cells are marked in the path grid
+		int32 MarkedCells = 0;
+		for (int Y = 0; Y < Path.Num(); ++Y)
+		{
+			for (int X = 0; X < Path[Y].Num(); ++X)
+			{
+				if (Path[Y][X] == 1)
+				{
+					MarkedCells++;
+				}
+			}
+		}
+		UE_LOG(LogMaze, Warning, TEXT("  Path grid has %d cells marked (should match path length)"), MarkedCells);
+	}
+
 	return Path;
 }
 
@@ -801,6 +1076,38 @@ void AMaze::ClearMaze()
 		UE_LOG(LogMaze, Log, TEXT("  Destroying previous endpoint actor '%s'"), *SpawnedEndpointActor->GetName());
 		SpawnedEndpointActor->Destroy();
 		SpawnedEndpointActor = nullptr;
+	}
+
+	// Destroy previously spawned entrance actor
+	if (SpawnedEntranceActor && IsValid(SpawnedEntranceActor))
+	{
+		UE_LOG(LogMaze, Log, TEXT("  Destroying previous entrance actor '%s'"), *SpawnedEntranceActor->GetName());
+		SpawnedEntranceActor->Destroy();
+		SpawnedEntranceActor = nullptr;
+	}
+
+	// Destroy previously spawned exit actor
+	if (SpawnedExitActor && IsValid(SpawnedExitActor))
+	{
+		UE_LOG(LogMaze, Log, TEXT("  Destroying previous exit actor '%s'"), *SpawnedExitActor->GetName());
+		SpawnedExitActor->Destroy();
+		SpawnedExitActor = nullptr;
+	}
+
+	// Destroy previously spawned entrance door actor
+	if (SpawnedEntranceDoorActor && IsValid(SpawnedEntranceDoorActor))
+	{
+		UE_LOG(LogMaze, Log, TEXT("  Destroying previous entrance door actor '%s'"), *SpawnedEntranceDoorActor->GetName());
+		SpawnedEntranceDoorActor->Destroy();
+		SpawnedEntranceDoorActor = nullptr;
+	}
+
+	// Destroy previously spawned exit door actor
+	if (SpawnedExitDoorActor && IsValid(SpawnedExitDoorActor))
+	{
+		UE_LOG(LogMaze, Log, TEXT("  Destroying previous exit door actor '%s'"), *SpawnedExitDoorActor->GetName());
+		SpawnedExitDoorActor->Destroy();
+		SpawnedExitDoorActor = nullptr;
 	}
 }
 
@@ -1247,6 +1554,514 @@ AActor* AMaze::SpawnEndpointActor()
 	}
 
 	return SpawnedEndpointActor;
+}
+
+AActor* AMaze::SpawnEntranceActor()
+{
+	UE_LOG(LogMaze, Log, TEXT("SpawnEntranceActor called"));
+
+	if (GameMode != EMazeGameMode::NavigateMaze)
+	{
+		UE_LOG(LogMaze, Warning, TEXT("  FAILED: GameMode is not NavigateMaze"));
+		return nullptr;
+	}
+
+	if (!EntranceActorClass)
+	{
+		UE_LOG(LogMaze, Warning, TEXT("  FAILED: EntranceActorClass is not set"));
+		return nullptr;
+	}
+
+	// Validate world exists
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogMaze, Error, TEXT("  FAILED: World is null!"));
+		return nullptr;
+	}
+
+	// Destroy existing entrance actor if any
+	if (SpawnedEntranceActor && IsValid(SpawnedEntranceActor))
+	{
+		UE_LOG(LogMaze, Log, TEXT("  Destroying existing entrance actor: %s"), *SpawnedEntranceActor->GetName());
+		SpawnedEntranceActor->Destroy();
+		SpawnedEntranceActor = nullptr;
+	}
+
+	// Get the entrance transform
+	FTransform EntranceTransform = GetMazeEntranceTransform();
+
+	// Spawn the actor
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.Owner = this;
+	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+	UE_LOG(LogMaze, Log, TEXT("  Spawning %s at location (%s)"),
+		*EntranceActorClass->GetName(),
+		*EntranceTransform.GetLocation().ToString());
+
+	SpawnedEntranceActor = World->SpawnActor<AActor>(EntranceActorClass, EntranceTransform, SpawnParams);
+
+	if (SpawnedEntranceActor)
+	{
+		UE_LOG(LogMaze, Log, TEXT("  SUCCESS: Spawned entrance actor '%s'"), *SpawnedEntranceActor->GetName());
+	}
+	else
+	{
+		UE_LOG(LogMaze, Error, TEXT("  FAILED: Could not spawn entrance actor!"));
+	}
+
+	return SpawnedEntranceActor;
+}
+
+AActor* AMaze::SpawnExitActor()
+{
+	UE_LOG(LogMaze, Log, TEXT("SpawnExitActor called"));
+
+	if (GameMode != EMazeGameMode::NavigateMaze)
+	{
+		UE_LOG(LogMaze, Warning, TEXT("  FAILED: GameMode is not NavigateMaze"));
+		return nullptr;
+	}
+
+	if (!ExitActorClass)
+	{
+		UE_LOG(LogMaze, Warning, TEXT("  FAILED: ExitActorClass is not set"));
+		return nullptr;
+	}
+
+	// Validate world exists
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogMaze, Error, TEXT("  FAILED: World is null!"));
+		return nullptr;
+	}
+
+	// Destroy existing exit actor if any
+	if (SpawnedExitActor && IsValid(SpawnedExitActor))
+	{
+		UE_LOG(LogMaze, Log, TEXT("  Destroying existing exit actor: %s"), *SpawnedExitActor->GetName());
+		SpawnedExitActor->Destroy();
+		SpawnedExitActor = nullptr;
+	}
+
+	// Get the exit transform
+	FTransform ExitTransform = GetMazeExitTransform();
+
+	// Spawn the actor
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.Owner = this;
+	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+	UE_LOG(LogMaze, Log, TEXT("  Spawning %s at location (%s)"),
+		*ExitActorClass->GetName(),
+		*ExitTransform.GetLocation().ToString());
+
+	SpawnedExitActor = World->SpawnActor<AActor>(ExitActorClass, ExitTransform, SpawnParams);
+
+	if (SpawnedExitActor)
+	{
+		UE_LOG(LogMaze, Log, TEXT("  SUCCESS: Spawned exit actor '%s'"), *SpawnedExitActor->GetName());
+	}
+	else
+	{
+		UE_LOG(LogMaze, Error, TEXT("  FAILED: Could not spawn exit actor!"));
+	}
+
+	return SpawnedExitActor;
+}
+
+FTransform AMaze::GetMazeEntranceTransform()
+{
+	UE_LOG(LogMaze, Log, TEXT("GetMazeEntranceTransform: Entrance at (%d,%d)"), MazeEntrance.X, MazeEntrance.Y);
+
+	if (GameMode != EMazeGameMode::NavigateMaze)
+	{
+		UE_LOG(LogMaze, Warning, TEXT("GetMazeEntranceTransform called but GameMode is not NavigateMaze!"));
+		return GetActorTransform();
+	}
+
+	// Calculate the scaled cell size based on floor width
+	const FVector2D ScaledCellSize = MazeCellSize * FloorWidth;
+
+	// Calculate base position of the logical cell
+	FVector LocalPosition(
+		ScaledCellSize.X * MazeEntrance.X,
+		ScaledCellSize.Y * MazeEntrance.Y,
+		0.f);
+
+	// Add offset to center of the scaled cell
+	LocalPosition.X += ScaledCellSize.X * 0.5f;
+	LocalPosition.Y += ScaledCellSize.Y * 0.5f;
+
+	// Calculate rotation based on which edge the entrance is on
+	FRotator Rotation = FRotator::ZeroRotator;
+
+	if (MazeEntrance.Y == 0)
+	{
+		// North edge (Y=0) - face south (into maze)
+		Rotation.Yaw = 90.0f;
+	}
+	else if (MazeEntrance.Y == MazeSize.Y - 1)
+	{
+		// South edge - face north (into maze)
+		Rotation.Yaw = -90.0f;
+	}
+	else if (MazeEntrance.X == 0)
+	{
+		// West edge (X=0) - face east (into maze)
+		Rotation.Yaw = 0.0f;
+	}
+	else if (MazeEntrance.X == MazeSize.X - 1)
+	{
+		// East edge - face west (into maze)
+		Rotation.Yaw = 180.0f;
+	}
+
+	// Create local transform
+	FTransform LocalTransform(Rotation, LocalPosition);
+
+	// Transform to world space
+	FTransform WorldTransform = LocalTransform * GetActorTransform();
+	UE_LOG(LogMaze, Log, TEXT("  World position: %s, Rotation: %s"),
+		*WorldTransform.GetLocation().ToString(), *WorldTransform.Rotator().ToString());
+	return WorldTransform;
+}
+
+FTransform AMaze::GetMazeExitTransform()
+{
+	UE_LOG(LogMaze, Log, TEXT("GetMazeExitTransform: Exit at (%d,%d)"), MazeExit.X, MazeExit.Y);
+
+	if (GameMode != EMazeGameMode::NavigateMaze)
+	{
+		UE_LOG(LogMaze, Warning, TEXT("GetMazeExitTransform called but GameMode is not NavigateMaze!"));
+		return GetActorTransform();
+	}
+
+	// Calculate the scaled cell size based on floor width
+	const FVector2D ScaledCellSize = MazeCellSize * FloorWidth;
+
+	// Calculate base position of the logical cell
+	FVector LocalPosition(
+		ScaledCellSize.X * MazeExit.X,
+		ScaledCellSize.Y * MazeExit.Y,
+		0.f);
+
+	// Add offset to center of the scaled cell
+	LocalPosition.X += ScaledCellSize.X * 0.5f;
+	LocalPosition.Y += ScaledCellSize.Y * 0.5f;
+
+	// Calculate rotation based on which edge the exit is on
+	FRotator Rotation = FRotator::ZeroRotator;
+
+	if (MazeExit.Y == 0)
+	{
+		// North edge (Y=0) - face south (into maze)
+		Rotation.Yaw = 90.0f;
+	}
+	else if (MazeExit.Y == MazeSize.Y - 1)
+	{
+		// South edge - face north (into maze)
+		Rotation.Yaw = -90.0f;
+	}
+	else if (MazeExit.X == 0)
+	{
+		// West edge (X=0) - face east (into maze)
+		Rotation.Yaw = 0.0f;
+	}
+	else if (MazeExit.X == MazeSize.X - 1)
+	{
+		// East edge - face west (into maze)
+		Rotation.Yaw = 180.0f;
+	}
+
+	// Create local transform
+	FTransform LocalTransform(Rotation, LocalPosition);
+
+	// Transform to world space
+	FTransform WorldTransform = LocalTransform * GetActorTransform();
+	UE_LOG(LogMaze, Log, TEXT("  World position: %s, Rotation: %s"),
+		*WorldTransform.GetLocation().ToString(), *WorldTransform.Rotator().ToString());
+	return WorldTransform;
+}
+
+FTransform AMaze::GetPlayerSpawnTransform()
+{
+	UE_LOG(LogMaze, Log, TEXT("GetPlayerSpawnTransform: GameMode = %d"), (int32)GameMode);
+
+	if (GameMode == EMazeGameMode::FindTheFlag)
+	{
+		// In FindTheFlag mode, spawn player at random location
+		return GetRandomSpawnTransform();
+	}
+	else if (GameMode == EMazeGameMode::NavigateMaze)
+	{
+		// In NavigateMaze mode, spawn player at entrance
+		return GetMazeEntranceTransform();
+	}
+
+	// Fallback
+	UE_LOG(LogMaze, Warning, TEXT("  Unknown game mode, using random spawn"));
+	return GetRandomSpawnTransform();
+}
+
+FTransform AMaze::GetEntranceDoorTransform()
+{
+	UE_LOG(LogMaze, Log, TEXT("GetEntranceDoorTransform: EntranceDoor at (%d,%d)"), MazeEntrance.X, MazeEntrance.Y);
+
+	if (GameMode != EMazeGameMode::NavigateMaze)
+	{
+		UE_LOG(LogMaze, Warning, TEXT("GetEntranceDoorTransform called but GameMode is not NavigateMaze!"));
+		return GetActorTransform();
+	}
+
+	// Door should be placed OUTSIDE the maze, at the entrance opening
+	// Position is calculated based on which edge the entrance is on
+
+	const FVector2D ScaledCellSize = MazeCellSize * FloorWidth;
+	FVector DoorPosition;
+	FRotator DoorRotation = FRotator::ZeroRotator;
+
+	// Calculate door position based on entrance edge
+	if (MazeEntrance.Y == 0)
+	{
+		// North edge - door is outside (negative Y)
+		DoorPosition = FVector(
+			ScaledCellSize.X * MazeEntrance.X + ScaledCellSize.X * 0.5f,
+			-MazeCellSize.Y * 0.5f,  // Outside the outline wall
+			0.f);
+		DoorRotation.Yaw = 90.0f;  // Face south (into maze)
+	}
+	else if (MazeEntrance.Y == MazeSize.Y - 1)
+	{
+		// South edge - door is outside (beyond max Y)
+		DoorPosition = FVector(
+			ScaledCellSize.X * MazeEntrance.X + ScaledCellSize.X * 0.5f,
+			ScaledCellSize.Y * MazeSize.Y + MazeCellSize.Y * 0.5f,
+			0.f);
+		DoorRotation.Yaw = -90.0f;  // Face north (into maze)
+	}
+	else if (MazeEntrance.X == 0)
+	{
+		// West edge - door is outside (negative X)
+		DoorPosition = FVector(
+			-MazeCellSize.X * 0.5f,
+			ScaledCellSize.Y * MazeEntrance.Y + ScaledCellSize.Y * 0.5f,
+			0.f);
+		DoorRotation.Yaw = 0.0f;  // Face east (into maze)
+	}
+	else if (MazeEntrance.X == MazeSize.X - 1)
+	{
+		// East edge - door is outside (beyond max X)
+		DoorPosition = FVector(
+			ScaledCellSize.X * MazeSize.X + MazeCellSize.X * 0.5f,
+			ScaledCellSize.Y * MazeEntrance.Y + ScaledCellSize.Y * 0.5f,
+			0.f);
+		DoorRotation.Yaw = 180.0f;  // Face west (into maze)
+	}
+	else
+	{
+		// Interior position (shouldn't happen in NavigateMaze mode)
+		UE_LOG(LogMaze, Warning, TEXT("  Entrance is not on an edge! Using entrance transform."));
+		return GetMazeEntranceTransform();
+	}
+
+	// Create local transform
+	FTransform LocalTransform(DoorRotation, DoorPosition);
+
+	// Transform to world space
+	FTransform WorldTransform = LocalTransform * GetActorTransform();
+	UE_LOG(LogMaze, Log, TEXT("  Door world position: %s, Rotation: %s"),
+		*WorldTransform.GetLocation().ToString(), *WorldTransform.Rotator().ToString());
+	return WorldTransform;
+}
+
+FTransform AMaze::GetExitDoorTransform()
+{
+	UE_LOG(LogMaze, Log, TEXT("GetExitDoorTransform: ExitDoor at (%d,%d)"), MazeExit.X, MazeExit.Y);
+
+	if (GameMode != EMazeGameMode::NavigateMaze)
+	{
+		UE_LOG(LogMaze, Warning, TEXT("GetExitDoorTransform called but GameMode is not NavigateMaze!"));
+		return GetActorTransform();
+	}
+
+	// Door should be placed OUTSIDE the maze, at the exit opening
+	// Position is calculated based on which edge the exit is on
+
+	const FVector2D ScaledCellSize = MazeCellSize * FloorWidth;
+	FVector DoorPosition;
+	FRotator DoorRotation = FRotator::ZeroRotator;
+
+	// Calculate door position based on exit edge
+	if (MazeExit.Y == 0)
+	{
+		// North edge - door is outside (negative Y)
+		DoorPosition = FVector(
+			ScaledCellSize.X * MazeExit.X + ScaledCellSize.X * 0.5f,
+			-MazeCellSize.Y * 0.5f,  // Outside the outline wall
+			0.f);
+		DoorRotation.Yaw = 90.0f;  // Face south (into maze)
+	}
+	else if (MazeExit.Y == MazeSize.Y - 1)
+	{
+		// South edge - door is outside (beyond max Y)
+		DoorPosition = FVector(
+			ScaledCellSize.X * MazeExit.X + ScaledCellSize.X * 0.5f,
+			ScaledCellSize.Y * MazeSize.Y + MazeCellSize.Y * 0.5f,
+			0.f);
+		DoorRotation.Yaw = -90.0f;  // Face north (into maze)
+	}
+	else if (MazeExit.X == 0)
+	{
+		// West edge - door is outside (negative X)
+		DoorPosition = FVector(
+			-MazeCellSize.X * 0.5f,
+			ScaledCellSize.Y * MazeExit.Y + ScaledCellSize.Y * 0.5f,
+			0.f);
+		DoorRotation.Yaw = 0.0f;  // Face east (into maze)
+	}
+	else if (MazeExit.X == MazeSize.X - 1)
+	{
+		// East edge - door is outside (beyond max X)
+		DoorPosition = FVector(
+			ScaledCellSize.X * MazeSize.X + MazeCellSize.X * 0.5f,
+			ScaledCellSize.Y * MazeExit.Y + ScaledCellSize.Y * 0.5f,
+			0.f);
+		DoorRotation.Yaw = 180.0f;  // Face west (into maze)
+	}
+	else
+	{
+		// Interior position (shouldn't happen in NavigateMaze mode)
+		UE_LOG(LogMaze, Warning, TEXT("  Exit is not on an edge! Using exit transform."));
+		return GetMazeExitTransform();
+	}
+
+	// Create local transform
+	FTransform LocalTransform(DoorRotation, DoorPosition);
+
+	// Transform to world space
+	FTransform WorldTransform = LocalTransform * GetActorTransform();
+	UE_LOG(LogMaze, Log, TEXT("  Door world position: %s, Rotation: %s"),
+		*WorldTransform.GetLocation().ToString(), *WorldTransform.Rotator().ToString());
+	return WorldTransform;
+}
+
+AActor* AMaze::SpawnEntranceDoorActor()
+{
+	UE_LOG(LogMaze, Log, TEXT("SpawnEntranceDoorActor called"));
+
+	if (GameMode != EMazeGameMode::NavigateMaze)
+	{
+		UE_LOG(LogMaze, Warning, TEXT("  FAILED: GameMode is not NavigateMaze"));
+		return nullptr;
+	}
+
+	if (!EntranceDoorActorClass)
+	{
+		UE_LOG(LogMaze, Warning, TEXT("  FAILED: EntranceDoorActorClass is not set"));
+		return nullptr;
+	}
+
+	// Validate world exists
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogMaze, Error, TEXT("  FAILED: World is null!"));
+		return nullptr;
+	}
+
+	// Destroy existing entrance door actor if any
+	if (SpawnedEntranceDoorActor && IsValid(SpawnedEntranceDoorActor))
+	{
+		UE_LOG(LogMaze, Log, TEXT("  Destroying existing entrance door actor: %s"), *SpawnedEntranceDoorActor->GetName());
+		SpawnedEntranceDoorActor->Destroy();
+		SpawnedEntranceDoorActor = nullptr;
+	}
+
+	// Get the entrance door transform
+	FTransform DoorTransform = GetEntranceDoorTransform();
+
+	// Spawn the actor
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.Owner = this;
+	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+	UE_LOG(LogMaze, Log, TEXT("  Spawning %s at location (%s)"),
+		*EntranceDoorActorClass->GetName(),
+		*DoorTransform.GetLocation().ToString());
+
+	SpawnedEntranceDoorActor = World->SpawnActor<AActor>(EntranceDoorActorClass, DoorTransform, SpawnParams);
+
+	if (SpawnedEntranceDoorActor)
+	{
+		UE_LOG(LogMaze, Log, TEXT("  SUCCESS: Spawned entrance door actor '%s'"), *SpawnedEntranceDoorActor->GetName());
+	}
+	else
+	{
+		UE_LOG(LogMaze, Error, TEXT("  FAILED: Could not spawn entrance door actor!"));
+	}
+
+	return SpawnedEntranceDoorActor;
+}
+
+AActor* AMaze::SpawnExitDoorActor()
+{
+	UE_LOG(LogMaze, Log, TEXT("SpawnExitDoorActor called"));
+
+	if (GameMode != EMazeGameMode::NavigateMaze)
+	{
+		UE_LOG(LogMaze, Warning, TEXT("  FAILED: GameMode is not NavigateMaze"));
+		return nullptr;
+	}
+
+	if (!ExitDoorActorClass)
+	{
+		UE_LOG(LogMaze, Warning, TEXT("  FAILED: ExitDoorActorClass is not set"));
+		return nullptr;
+	}
+
+	// Validate world exists
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogMaze, Error, TEXT("  FAILED: World is null!"));
+		return nullptr;
+	}
+
+	// Destroy existing exit door actor if any
+	if (SpawnedExitDoorActor && IsValid(SpawnedExitDoorActor))
+	{
+		UE_LOG(LogMaze, Log, TEXT("  Destroying existing exit door actor: %s"), *SpawnedExitDoorActor->GetName());
+		SpawnedExitDoorActor->Destroy();
+		SpawnedExitDoorActor = nullptr;
+	}
+
+	// Get the exit door transform
+	FTransform DoorTransform = GetExitDoorTransform();
+
+	// Spawn the actor
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.Owner = this;
+	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+	UE_LOG(LogMaze, Log, TEXT("  Spawning %s at location (%s)"),
+		*ExitDoorActorClass->GetName(),
+		*DoorTransform.GetLocation().ToString());
+
+	SpawnedExitDoorActor = World->SpawnActor<AActor>(ExitDoorActorClass, DoorTransform, SpawnParams);
+
+	if (SpawnedExitDoorActor)
+	{
+		UE_LOG(LogMaze, Log, TEXT("  SUCCESS: Spawned exit door actor '%s'"), *SpawnedExitDoorActor->GetName());
+	}
+	else
+	{
+		UE_LOG(LogMaze, Error, TEXT("  FAILED: Could not spawn exit door actor!"));
+	}
+
+	return SpawnedExitDoorActor;
 }
 
 FTransform AMaze::GetRandomSpawnTransform()
